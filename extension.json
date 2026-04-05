@@ -9,11 +9,19 @@
   "requires": {
     "MediaWiki": ">= 1.45.0"
   },
+  "config": {
+    "NsfwFilterPlaceholderImage": {
+      "value": "NSFW-Placeholder.png",
+      "path": false,
+      "description": "File title used as the server-side placeholder for NSFW files requested through the NsfwFilter proxy endpoint by viewers who are not allowed to see the original media.",
+      "public": false
+    }
+  },
   "AutoloadClasses": {
-    "NSFWBlur\\Hooks": "includes/Hooks.php"
+    "NsfwFilter\\Hooks": "includes/Hooks.php"
   },
   "MessagesDirs": {
-    "NSFWBlur": [
+    "NsfwFilter": [
       "i18n"
     ]
   },
@@ -37,61 +45,25 @@
   "DefaultUserOptions": {
     "nsfwblurred": 0
   },
-  "ResourceModules": {
-    "ext.nsfwblur.top": {
-        "localBasePath": ".",
-        "remoteExtPath": "NsfwFilter",
-        "position": "top",
-        "dependencies": [
-        "mediawiki.util",
-        "mediawiki.Uri",
-        "mediawiki.Title"
-        ],
-        "scripts": [
-        "modules/nsfw-blur.top.js"
-        ],
-        "targets": [ "desktop", "mobile" ]
-    },
-    "ext.nsfwblur": {
-        "localBasePath": ".",
-        "remoteExtPath": "NsfwFilter",
-        "dependencies": [
-        "user.options",
-        "mediawiki.util",
-        "mediawiki.Uri",
-        "mediawiki.Title"
-        ],
-        "scripts": [
-        "modules/nsfw-blur.js"
-        ],
-        "targets": [ "desktop", "mobile" ]
-    },
-    "ext.nsfwblur.styles": {
-        "localBasePath": ".",
-        "remoteExtPath": "NsfwFilter",
-        "styles": [
-        "modules/nsfw-blur.css"
-        ],
-        "targets": [ "desktop", "mobile" ]
-    }
-    },
     "Hooks": {
-        "BeforePageDisplay": "NSFWBlur\\Hooks::onBeforePageDisplay",
-        "OutputPageBeforeHTML": "NSFWBlur\\Hooks::onOutputPageBeforeHTML",
-        "ThumbnailBeforeProduceHTML": "NSFWBlur\\Hooks::onThumbnailBeforeProduceHTML",
-        "OutputPageParserOutput": "NSFWBlur\\Hooks::onOutputPageParserOutput",
-        "OutputPageParserOutputComplete": "NSFWBlur\\Hooks::onOutputPageParserOutputComplete",
+        "BeforePageDisplay": "NsfwFilter\\Hooks::onBeforePageDisplay",
+        "OutputPageBeforeHTML": "NsfwFilter\\Hooks::onOutputPageBeforeHTML",
+        "ThumbnailBeforeProduceHTML": "NsfwFilter\\Hooks::onThumbnailBeforeProduceHTML",
+        "OutputPageParserOutput": "NsfwFilter\\Hooks::onOutputPageParserOutput",
+        "OutputPageParserOutputComplete": "NsfwFilter\\Hooks::onOutputPageParserOutputComplete",
 
-        "ParserOutput": "NSFWBlur\\Hooks::onParserOutput",
+        "ParserOutput": "NsfwFilter\\Hooks::onParserOutput",
 
-        "SpecialPageBeforeExecute": "NSFWBlur\\Hooks::onSpecialPageBeforeExecute",
+        "SpecialPageBeforeExecute": "NsfwFilter\\Hooks::onSpecialPageBeforeExecute",
 
-        "ImageBeforeProduceHTML": "NSFWBlur\\Hooks::onImageBeforeProduceHTML",
-        "GetPreferences": "NSFWBlur\\Hooks::onGetPreferences",
+        "ImageBeforeProduceHTML": "NsfwFilter\\Hooks::onImageBeforeProduceHTML",
+        "ImagePageFindFile": "NsfwFilter\\Hooks::onImagePageFindFile",
+        "ImgAuthModifyHeaders": "NsfwFilter\\Hooks::onImgAuthModifyHeaders",
+        "GetPreferences": "NsfwFilter\\Hooks::onGetPreferences",
 
-        "PageRenderingHash": "NSFWBlur\\Hooks::onPageRenderingHash",
-        "UserGetDefaultOptions": "NSFWBlur\\Hooks::onUserGetDefaultOptions",
-        "UserSaveOptions": "NSFWBlur\\Hooks::onUserSaveOptions"        
+        "PageRenderingHash": "NsfwFilter\\Hooks::onPageRenderingHash",
+        "UserGetDefaultOptions": "NsfwFilter\\Hooks::onUserGetDefaultOptions",
+        "UserSaveOptions": "NsfwFilter\\Hooks::onUserSaveOptions"        
    }
         
 }

@@ -1,17 +1,19 @@
 <?php
-namespace NSFWBlur;
+namespace NsfwFilter;
 
 if ( !defined( 'MEDIAWIKI' ) ) {
     die();
 }
 
 use MediaWiki\Context\RequestContext;
+use MediaWiki\FileRepo\File\File;
 use MediaWiki\Html\FormOptions;
 use MediaWiki\Html\Html;
 use MediaWiki\MediaWikiServices;
 use MediaWiki\Pager\ImageListPager;
 use MediaWiki\Pager\NewFilesPager;
 use MediaWiki\Parser\ParserOutput;
+use MediaWiki\Request\ContentSecurityPolicy;
 use MediaWiki\Revision\RevisionRecord;
 use MediaWiki\Revision\SlotRecord;
 use MediaWiki\SpecialPage\SpecialPage;
@@ -22,11 +24,16 @@ use Skin;
 use MediaWiki\Title\Title;
 
 use User;
+use Wikimedia\FileBackend\HTTPFileStreamer;
 
 class Hooks {
     private const NSFW_MARKER = '__NSFW__';
     private const NSFW_CATEGORY_DBKEY = 'NSFW'; // Category:NSFW
+    private const NSFW_FILE_CATEGORY_DBKEY = 'NSFW_Files'; // Category:NSFW_Files
     private const UNBLUR_RIGHT = 'nsfw-unblur';
+    private const PLACEHOLDER_CONFIG = 'NsfwFilterPlaceholderImage';
+    private const NSFW_ROBOTS_TAG = 'noindex, noimageindex, noarchive';
+    private const PROXY_ENTRY_POINT = 'nsfwProxy.php';
 
     private const OPT_UNBLUR           = 'nsfwblurred';
     private const OPT_BIRTHDATE        = 'nsfw_birthdate';
@@ -57,44 +64,7 @@ class Hooks {
             $out->addBodyClasses( 'nsfw-unblur' );
         }
 
-        // Pull any existing list (set earlier by ParserOutput hooks)
-        $existing = [];
-        if ( method_exists( $out, 'getJsConfigVars' ) ) {
-            $vars = $out->getJsConfigVars();
-            if ( isset( $vars['wgNSFWFilesOnPage'] ) && is_array( $vars['wgNSFWFilesOnPage'] ) ) {
-                $existing = $vars['wgNSFWFilesOnPage'];
-            }
-        }
-
-        $fromHtml = [];
-
-        // Keep your HTML scrape behavior (works for some infobox HTML cases),
-        // but DO NOT allow it to wipe out the parser-derived list.
-        if ( !$userWantsUnblur && $isContentPage ) {
-            $html = self::getOutputHtml( $out );
-            $dbKeys = self::extractImageDbKeysFromHtml( $html );
-
-            foreach ( $dbKeys as $dbKey ) {
-                $fileTitle = Title::makeTitleSafe( NS_FILE, $dbKey );
-                if ( !$fileTitle ) {
-                    continue;
-                }
-                if ( self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-                    $fromHtml[] = $fileTitle->getPrefixedText();
-                }
-            }
-
-            $fromHtml = array_values( array_unique( $fromHtml ) );
-        }
-
         if ( $isContentPage ) {
-            $merged = array_values( array_unique( array_merge( $existing, $fromHtml ) ) );
-            sort( $merged );
-
-            $out->addJsConfigVars( [
-                'wgNSFWFilesOnPage' => $merged,
-            ] );
-
             if ( self::shouldRestrictPageContent( $services, $out ) ) {
                 $out->addBodyClasses( 'nsfw-page-restricted' );
                 $out->addJsConfigVars( [ 'wgNSFWPage' => true ] );
@@ -102,10 +72,6 @@ class Hooks {
         }
 
         $out->addInlineStyle( self::getEarlyInlineCss() );
-        $out->addModules( [ 'ext.nsfwblur.top', 'ext.nsfwblur' ] );
-        $out->addModuleStyles( [ 'ext.nsfwblur.styles' ] );
-
-        self::applyFilePageBlurClass( $out, $userWantsUnblur );
 
         return true;
     }
@@ -145,11 +111,24 @@ class Hooks {
 
     public static function onOutputPageBeforeHTML( OutputPage $out, &$text ): void {
         $services = MediaWikiServices::getInstance();
-        if ( !self::shouldRestrictPageContent( $services, $out ) ) {
+        if ( self::shouldRestrictPageContent( $services, $out ) ) {
+            $text = self::buildRestrictedPageHtml( $out );
             return;
         }
 
-        $text = self::buildRestrictedPageHtml( $out );
+        $text = self::rewriteNsfwImgAuthUrlsInHtml( $text );
+        $text = self::rewriteNsfwMediaUrlsInHtml( $text );
+        $text = self::rewriteNsfwDomAttributesInHtml( $text );
+        
+        $title = $out->getTitle();
+        if (
+            $title
+            && $title->inNamespace( NS_FILE )
+            && self::isFileTitleMarkedNSFW( $title )
+            && $out->getRequest()->getVal( 'action', 'view' ) === 'view'
+        ) {
+            $text = self::rewriteNsfwFilePageSizeLinks( $text, $title );
+        }
     }
 
     private static function buildRestrictedPageHtml( OutputPage $out ): string {
@@ -213,107 +192,12 @@ class Hooks {
     }
 
     private static function injectNsfwFilesOnPageFromParserOutput( OutputPage $out, ParserOutput $parserOutput ): void {
-        $services = MediaWikiServices::getInstance();
-        $user     = $out->getUser();
-        $title    = $out->getTitle();
-
-        // Run everywhere except Special: pages
-        if ( !$title || $title->isSpecialPage() ) {
-            return;
-        }
-
-        // Respect user unblur preference
-        if ( self::userWantsUnblur( $services, $user ) ) {
-            if ( method_exists( $parserOutput, 'setJsConfigVar' ) ) {
-                $parserOutput->setJsConfigVar( 'wgNSFWFilesOnPage', [] );
-            } else {
-                $parserOutput->addJsConfigVars( 'wgNSFWFilesOnPage', [] );
-            }
-            return;
-        }
-
-        $dbKeys = [];
-
-        // 1) MW 1.43+ preferred API: ParserOutputLinkTypes::MEDIA
-        if ( class_exists( 'MediaWiki\\Parser\\ParserOutputLinkTypes' ) && method_exists( $parserOutput, 'getLinkList' ) ) {
-            $media = $parserOutput->getLinkList( \MediaWiki\Parser\ParserOutputLinkTypes::MEDIA );
-            if ( is_array( $media ) ) {
-                // getLinkList typically returns an associative array keyed by DB key
-                $dbKeys = array_merge( $dbKeys, array_keys( $media ) );
-            }
-        } else {
-            // 2) Older API (deprecated in 1.43, but still works)
-            if ( method_exists( $parserOutput, 'getImages' ) ) {
-                $images = $parserOutput->getImages();
-                if ( is_array( $images ) ) {
-                    $dbKeys = array_merge( $dbKeys, array_keys( $images ) );
-                }
-            }
-        }
-
-        // 3) Scrape parser HTML as a secondary net (PortableInfobox / odd output)
-        $html = '';
-        if ( method_exists( $parserOutput, 'getRawText' ) ) {
-            $html = (string)$parserOutput->getRawText();
-        } elseif ( method_exists( $parserOutput, 'getText' ) ) {
-            // older MW fallback
-            $html = (string)$parserOutput->getText();
-        }
-
-        if ( is_string( $html ) && $html !== '' ) {
-            $dbKeys = array_merge( $dbKeys, self::extractImageDbKeysFromHtml( $html ) );
-        }
-
-        // 4) Hard reliability net: imagelinks table (usually fixes galleries)
-        $pageId = $title->getArticleID();
-        if ( $pageId ) {
-            try {
-                $dbr = $services->getConnectionProvider()->getReplicaDatabase();
-                $res = $dbr->newSelectQueryBuilder()
-                    ->select( [ 'il_to' ] )
-                    ->from( 'imagelinks' )
-                    ->where( [ 'il_from' => $pageId ] )
-                    ->caller( __METHOD__ )
-                    ->fetchResultSet();
-
-                foreach ( $res as $row ) {
-                    if ( !empty( $row->il_to ) ) {
-                        $dbKeys[] = (string)$row->il_to; // DB key like "Anita3.png"
-                    }
-                }
-            } catch ( \Throwable $e ) {
-                // ignore DB failures; other sources may still work
-            }
-        }
-
-        // Normalize + unique
-        $dbKeys = array_values( array_unique( array_filter( array_map(
-            static function ( $v ) {
-                return ( is_string( $v ) && $v !== '' ) ? $v : null;
-            },
-            $dbKeys
-        ) ) ) );
-
-        // Resolve which of those are NSFW
-        $nsfw = [];
-        foreach ( $dbKeys as $dbKey ) {
-            $fileTitle = Title::makeTitleSafe( NS_FILE, $dbKey );
-            if ( !$fileTitle ) {
-                continue;
-            }
-            if ( self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-                $nsfw[] = $fileTitle->getPrefixedText();
-            }
-        }
-
-        $nsfw = array_values( array_unique( $nsfw ) );
-        sort( $nsfw );
-
-        // Prefer non-deprecated setter
+        // Frontend file blur is disabled. Keep the legacy config key empty so any
+        // leftover client code stays inert while the NSFW proxy decides the payload.
         if ( method_exists( $parserOutput, 'setJsConfigVar' ) ) {
-            $parserOutput->setJsConfigVar( 'wgNSFWFilesOnPage', $nsfw );
+            $parserOutput->setJsConfigVar( 'wgNSFWFilesOnPage', [] );
         } else {
-            $parserOutput->addJsConfigVars( 'wgNSFWFilesOnPage', $nsfw );
+            $parserOutput->addJsConfigVars( 'wgNSFWFilesOnPage', [] );
         }
     }
 
@@ -324,36 +208,43 @@ class Hooks {
      *  Hook: ParserOutput
      * ========================================================== */
     public static function onThumbnailBeforeProduceHTML( $thumbnail, array &$attribs, &$linkAttribs, ...$more ): void {
-        if ( !is_array( $linkAttribs ) ) {
-            $linkAttribs = [];
-        }
-        // Honor the user's preference, even though this hook doesn't receive $user.
-        $services = MediaWikiServices::getInstance();
-        $user = RequestContext::getMain()->getUser();
-        if ( $user instanceof User && self::userWantsUnblur( $services, $user ) ) {
-            return;
-        }
-
-        if ( !is_object( $thumbnail ) || !method_exists( $thumbnail, 'getFile' ) ) {
+        if ( !method_exists( $thumbnail, 'getFile' ) ) {
             return;
         }
 
         $file = $thumbnail->getFile();
-        if ( !$file || !method_exists( $file, 'getTitle' ) ) {
+        if ( !$file instanceof File ) {
             return;
         }
 
-        $fileTitle = $file->getTitle();
-        if ( !$fileTitle instanceof Title ) {
+        $fileTitle = self::resolveRenderedNsfwFileTitle( $file );
+        if ( !$fileTitle || !self::isFileTitleMarkedNSFW( $fileTitle ) ) {
             return;
         }
 
-        if ( !self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-            return;
+        $transformParams = self::extractTransformParamsFromRenderedAttributes( $attribs );
+        $attribs['src'] = self::buildProxyUrlForFileTitle( $fileTitle, $transformParams );
+
+        if ( isset( $attribs['srcset'] ) && is_string( $attribs['srcset'] ) ) {
+            $attribs['srcset'] = self::rewriteProxySrcSet(
+                $attribs['srcset'],
+                $fileTitle,
+                $transformParams
+            );
         }
 
-        $attribs['class'] = trim( ( $attribs['class'] ?? '' ) . ' nsfw-blur' );
-        $linkAttribs['class'] = trim( ( $linkAttribs['class'] ?? '' ) . ' nsfw-blur' );
+        if (
+            is_array( $linkAttribs )
+            && isset( $linkAttribs['href'] )
+            && is_string( $linkAttribs['href'] )
+            && self::shouldRewriteRenderedFileHref( $linkAttribs['href'], $file )
+        ) {
+            $linkParams = self::extractTransformParamsFromUrl( $linkAttribs['href'] );
+            if ( $linkParams === [] ) {
+                $linkParams = $transformParams;
+            }
+            $linkAttribs['href'] = self::buildProxyUrlForFileTitle( $fileTitle, $linkParams );
+        }
     }
     public static function onParserOutput( Parser $parser, ParserOutput $po, ...$args ): bool {
         // Debug/inspection only; not relied on for the final blur list.
@@ -382,43 +273,47 @@ class Hooks {
 
         $keys = [];
 
-        // 0) data-file-name="Foo.png" (some gallery/skins/widgets)
-        if ( preg_match_all( '/\bdata-file-name="([^"]+\.[a-z0-9]{2,5})"/i', $html, $m ) ) {
+        // 0) data-file-name="Foo.png"
+        if ( preg_match_all( '~\bdata-file-name="([^"]+\.[a-z0-9]{2,5})"~i', $html, $m ) ) {
             foreach ( $m[1] as $name ) {
                 $keys[] = self::normalizeDbKeyFromMaybeUrlOrName( $name );
             }
         }
 
-        // 0.5) data-title="File:Foo.png" (common in some output)
-        if ( preg_match_all( '/\bdata-title="([^"]+)"/i', $html, $m ) ) {
+        // 0.5) data-title="File:Foo.png"
+        if ( preg_match_all( '~\bdata-title="([^"]+)"~i', $html, $m ) ) {
             foreach ( $m[1] as $val ) {
                 $keys[] = self::normalizeDbKeyFromMaybeUrlOrName( $val );
             }
         }
 
         // 1) <img ... alt="Foo.png">
-        if ( preg_match_all( '/\balt="([^"]+\.[a-z0-9]{2,5})"/i', $html, $m ) ) {
+        if ( preg_match_all( '~\balt="([^"]+\.[a-z0-9]{2,5})"~i', $html, $m ) ) {
             foreach ( $m[1] as $name ) {
                 $keys[] = self::normalizeDbKeyFromMaybeUrlOrName( $name );
             }
         }
 
         // 2) <a ... title="File:Foo.png"> or title="Foo.png"
-        if ( preg_match_all( '/\btitle="([^"]+\.[a-z0-9]{2,5})"/i', $html, $m ) ) {
+        if ( preg_match_all( '~\btitle="([^"]+\.[a-z0-9]{2,5})"~i', $html, $m ) ) {
             foreach ( $m[1] as $name ) {
                 $keys[] = self::normalizeDbKeyFromMaybeUrlOrName( $name );
             }
         }
 
-        // 3) Direct file URL: /w/images/6/60/Foo.png
-        if ( preg_match_all( '#/w/images/[^/]+/[^/]+/([^/"\'\?#]+\.[a-z0-9]{2,5})#i', $html, $m ) ) {
+        // 3) Direct file URL: /images/6/60/Foo.png or /img_auth.php/1/17/Foo.png
+        if ( preg_match_all(
+            '~/(?:img_auth\.php/[^/]+/[^/]+|images/[^/]+/[^/]+)/([^/"\'\?#]+\.[a-z0-9]{2,5})~i',
+            $html,
+            $m
+        ) ) {
             foreach ( $m[1] as $name ) {
                 $keys[] = self::normalizeDbKeyFromMaybeUrlOrName( $name );
             }
         }
 
-        // 4) Thumb URL: /w/images/thumb/.../Foo.png/320px-Foo.png
-        if ( preg_match_all( '#/w/images/thumb/[^/]+/[^/]+/([^/"\'\?#]+\.[a-z0-9]{2,5})/#i', $html, $m ) ) {
+        // 4) Thumb URL: /img_auth.php/thumb/.../Foo.png/320px-Foo.png or /images/thumb/.../Foo.png/320px-Foo.png
+        if ( preg_match_all( '#/(?:img_auth\.php|images)/thumb/[^/]+/[^/]+/([^/"\'\?#]+\.[a-z0-9]{2,5})/#i', $html, $m ) ) {
             foreach ( $m[1] as $name ) {
                 $keys[] = self::normalizeDbKeyFromMaybeUrlOrName( $name );
             }
@@ -438,8 +333,7 @@ class Hooks {
             }
         }
 
-        $keys = array_values( array_unique( array_filter( $keys ) ) );
-        return $keys;
+        return array_values( array_unique( array_filter( $keys ) ) );
     }
 
     private static function normalizeDbKeyFromMaybeUrlOrName( string $raw ): string {
@@ -475,136 +369,8 @@ class Hooks {
             return;
         }
 
-        $out      = $special->getOutput();
-        $services = MediaWikiServices::getInstance();
-        $user     = $out->getUser();
-
-        $out->addInlineStyle( self::getEarlyInlineCss() );
-        $out->addModules( [ 'ext.nsfwblur', 'ext.nsfwblur.top' ] );
-        $out->addModuleStyles( [ 'ext.nsfwblur.styles' ] );
-
-        if ( self::userWantsUnblur( $services, $user ) ) {
-            $out->addBodyClasses( 'nsfw-unblur' );
-            $out->addJsConfigVars( 'wgNSFWFilesOnPage', [] );
-            return;
-        }
-
-        $nsfw = [];
-
-        if ( $name === 'listfiles' ) {
-            $request   = $special->getRequest();
-            $including = method_exists( $special, 'including' ) ? (bool)$special->including() : false;
-
-            if ( $including ) {
-                $userName = (string)$subPage;
-                $search   = '';
-                $showAll  = false;
-            } else {
-                $userName = $request->getText( 'user', $subPage ?? '' );
-                $search   = $request->getText( 'ilsearch', '' );
-                $showAll  = $request->getBool( 'ilshowall', false );
-            }
-
-            $canonical = $services->getUserNameUtils()->getCanonical( $userName, UserRigorOptions::RIGOR_NONE );
-            if ( $canonical !== false ) {
-                $userName = $canonical;
-            }
-
-            $opts = new FormOptions();
-            $opts->add( 'limit', 50 );
-            $opts->add( 'user', $userName );
-            $opts->add( 'ilsearch', $search );
-            $opts->add( 'ilshowall', $showAll );
-
-            $pager = new ImageListPager(
-                $special->getContext(),
-                $services->getCommentStore(),
-                $special->getLinkRenderer(),
-                $services->getConnectionProvider(),
-                $services->getRepoGroup(),
-                $services->getUserNameUtils(),
-                $services->getRowCommentFormatter(),
-                $services->getLinkBatchFactory(),
-                $userName,
-                $search,
-                $including,
-                $showAll
-            );
-
-            $pager->doQuery();
-            $res = $pager->getResult();
-
-            foreach ( $res as $row ) {
-                if ( empty( $row->img_name ) ) {
-                    continue;
-                }
-                $fileTitle = Title::makeTitleSafe( NS_FILE, $row->img_name );
-                if ( $fileTitle && self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-                    $nsfw[] = $fileTitle->getPrefixedText();
-                }
-            }
-        }
-
-        if ( $name === 'newfiles' || $name === 'newimages' ) {
-            $request = $special->getRequest();
-
-            if ( class_exists( NewFilesPager::class ) ) {
-                try {
-                    $pager = new NewFilesPager(
-                        $special->getContext(),
-                        $services->getGroupPermissionsLookup(),
-                        $services->getLinkBatchFactory(),
-                        $services->getLinkRenderer(),
-                        $services->getConnectionProvider(),
-                        $opts
-                    );
-                    $pager->doQuery();
-                    $res = $pager->getResult();
-
-                    foreach ( $res as $row ) {
-                        $nameField = $row->img_name ?? null;
-                        if ( !$nameField ) {
-                            continue;
-                        }
-                        $fileTitle = Title::makeTitleSafe( NS_FILE, $nameField );
-                        if ( $fileTitle && self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-                            $nsfw[] = $fileTitle->getPrefixedText();
-                        }
-                    }
-                } catch ( \Throwable $e ) {
-                    // fall back below
-                }
-            }
-
-            if ( !$nsfw ) {
-                $limit = $request->getInt( 'limit', 50 );
-                $limit = max( 1, min( 500, $limit ) );
-
-                $dbr = $services->getConnectionProvider()->getReplicaDatabase();
-                $rows = $dbr->newSelectQueryBuilder()
-                    ->select( [ 'img_name' ] )
-                    ->from( 'image' )
-                    ->orderBy( 'img_timestamp', 'DESC' )
-                    ->limit( $limit )
-                    ->caller( __METHOD__ )
-                    ->fetchResultSet();
-
-                foreach ( $rows as $row ) {
-                    if ( empty( $row->img_name ) ) {
-                        continue;
-                    }
-                    $fileTitle = Title::makeTitleSafe( NS_FILE, $row->img_name );
-                    if ( $fileTitle && self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-                        $nsfw[] = $fileTitle->getPrefixedText();
-                    }
-                }
-            }
-        }
-
-        $nsfw = array_values( array_unique( $nsfw ) );
-        sort( $nsfw );
-
-        $out->addJsConfigVars( 'wgNSFWFilesOnPage', $nsfw );
+        // Special file listings should render normal file HTML. Any NSFW
+        // replacement now happens later through the NSFW proxy endpoint.
     }
 
     /* ============================================================
@@ -641,7 +407,7 @@ class Hooks {
     }
 
     /* ============================================================
-     *  IMAGE BLUR (SERVER-SIDE CLASSES FOR THUMBS)
+     *  FILE HTML OUTPUT
      *  NOTE: MW 1.43 passes MORE parameters than older MW.
      *        This signature is intentionally compatible.
      * ========================================================== */
@@ -659,31 +425,211 @@ class Hooks {
         &$widthOption,
         ...$more
     ): bool {
-        // Bail if $file isn't a File-like object
-        if ( !is_object( $file ) || !method_exists( $file, 'getTitle' ) ) {
+        $fileTitle = self::normalizeRenderedFileTitle( $title, $file );
+        if ( !$fileTitle || !self::isFileTitleMarkedNSFW( $fileTitle ) ) {
             return true;
         }
 
-        $fileTitle = $file->getTitle();
-        if ( !$fileTitle || !is_object( $fileTitle ) || !method_exists( $fileTitle, 'inNamespace' ) ) {
-            return true;
+        if (
+            isset( $frameParams['link-url'] )
+            && is_string( $frameParams['link-url'] )
+            && $file instanceof File
+            && self::shouldRewriteRenderedFileHref( $frameParams['link-url'], $file )
+        ) {
+            $frameParams['link-url'] = self::buildProxyUrlForFileTitle(
+                $fileTitle,
+                self::extractTransformParamsFromHandlerParams( $handlerParams )
+            );
         }
-
-        // If this isn't NSFW, do nothing
-        try {
-            if ( !self::isFileTitleMarkedNSFW( $fileTitle ) ) {
-                return true;
-            }
-        } catch ( \Throwable $e ) {
-            // Never let this hook kill rendering/indexing
-            return true;
-        }
-
-        $frameParams['class']     = trim( ( $frameParams['class'] ?? '' ) . ' nsfw-blur' );
-        $frameParams['img-class'] = trim( ( $frameParams['img-class'] ?? '' ) . ' nsfw-blur' );
-        $handlerParams['class']   = trim( ( $handlerParams['class'] ?? '' ) . ' nsfw-blur' );
 
         return true;
+    }
+
+    /* ============================================================
+     *  FILE PROXY (SERVER-SIDE FILE REPLACEMENT)
+     * ========================================================== */
+
+    public static function onImgAuthBeforeStream( &$title, &$path, &$name, &$result ): bool {
+        // Public wikis do not reliably invoke this hook for file delivery.
+        // NsfwFilter uses its own proxy endpoint instead.
+        return true;
+    }
+
+    public static function handleProxyRequest(): void {
+        $services = MediaWikiServices::getInstance();
+        $fileTitle = self::resolveProxyRequestTitle();
+        if ( !$fileTitle || !$fileTitle->inNamespace( NS_FILE ) ) {
+            self::emitProxyError( 404, 'File not found.' );
+        }
+
+        $requestedFile = self::resolveRepoFile( $services, $fileTitle );
+        if ( !$requestedFile || !$requestedFile->exists() ) {
+            self::emitProxyError( 404, 'File not found.' );
+        }
+
+        $user = RequestContext::getMain()->getUser();
+        $isNsfw = self::isFileTitleMarkedNSFW( $fileTitle );
+        $streamFile = $requestedFile;
+
+        if (
+            $user instanceof User
+            && self::shouldUsePlaceholderReplacement( $services, $fileTitle, $user )
+        ) {
+            $placeholderFile = self::resolvePlaceholderFile( $services );
+            if ( !$placeholderFile ) {
+                self::emitProxyError( 404, 'NSFW placeholder file is not configured or missing.', $isNsfw );
+            }
+            $streamFile = $placeholderFile;
+        }
+
+        self::streamProxyFile(
+            $streamFile,
+            self::extractTransformParamsFromRequest(),
+            $isNsfw
+        );
+    }
+    private static function rewriteNsfwDomAttributesInHtml( string $html ): string {
+        if ( $html === '' ) {
+            return $html;
+        }
+
+        if (
+            stripos( $html, 'img_auth.php' ) === false
+            && stripos( $html, '/images/' ) === false
+            && stripos( $html, '/thumb/' ) === false
+        ) {
+            return $html;
+        }
+
+        $nsfwFileTitles = self::collectNsfwFileTitlesFromHtml( $html );
+
+        $previousUseInternalErrors = libxml_use_internal_errors( true );
+        $dom = new \DOMDocument();
+
+        $wrapperId = 'nsfwfilter-html-wrapper';
+        $encoded = mb_convert_encoding(
+            '<div id="' . $wrapperId . '">' . $html . '</div>',
+            'HTML-ENTITIES',
+            'UTF-8'
+        );
+
+        $loaded = $dom->loadHTML(
+            $encoded,
+            LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD
+        );
+
+        if ( !$loaded ) {
+            libxml_clear_errors();
+            libxml_use_internal_errors( $previousUseInternalErrors );
+            return $html;
+        }
+
+        $xpath = new \DOMXPath( $dom );
+
+        /** @var \DOMElement $element */
+        foreach ( $xpath->query( '//*[@src or @srcset or @data-src or @href or @style]' ) as $element ) {
+            foreach ( [ 'src', 'data-src', 'href' ] as $attr ) {
+                if ( !$element->hasAttribute( $attr ) ) {
+                    continue;
+                }
+
+                $original = $element->getAttribute( $attr );
+                $rewritten = self::rewriteNsfwImgAuthAttributeUrl( $attr, $original );
+
+                if ( $rewritten === $original && $nsfwFileTitles !== [] ) {
+                    $rewritten = self::rewriteNsfwMediaAttributeUrl(
+                        $attr,
+                        $original,
+                        $nsfwFileTitles
+                    );
+                }
+
+                if ( $rewritten !== $original ) {
+                    $element->setAttribute( $attr, $rewritten );
+                }
+            }
+
+            if ( $element->hasAttribute( 'srcset' ) ) {
+                $originalSrcSet = $element->getAttribute( 'srcset' );
+                $rewrittenSrcSet = self::rewriteNsfwImgAuthSrcSetAttributeValue( $originalSrcSet );
+
+                if ( $rewrittenSrcSet === $originalSrcSet && $nsfwFileTitles !== [] ) {
+                    $rewrittenSrcSet = self::rewriteNsfwSrcSetAttributeValue(
+                        $originalSrcSet,
+                        $nsfwFileTitles
+                    );
+                }
+
+                if ( $rewrittenSrcSet !== $originalSrcSet ) {
+                    $element->setAttribute( 'srcset', $rewrittenSrcSet );
+                }
+            }
+
+            if ( $element->hasAttribute( 'style' ) && $nsfwFileTitles !== [] ) {
+                $originalStyle = $element->getAttribute( 'style' );
+                $rewrittenStyle = self::rewriteNsfwBackgroundImageStyleUrls(
+                    $originalStyle,
+                    $nsfwFileTitles
+                );
+
+                if ( $rewrittenStyle !== $originalStyle ) {
+                    $element->setAttribute( 'style', $rewrittenStyle );
+                }
+            }
+        }
+
+        $wrapper = $dom->getElementById( $wrapperId );
+        if ( !$wrapper ) {
+            libxml_clear_errors();
+            libxml_use_internal_errors( $previousUseInternalErrors );
+            return $html;
+        }
+
+        $output = '';
+        foreach ( $wrapper->childNodes as $child ) {
+            $output .= $dom->saveHTML( $child );
+        }
+
+        libxml_clear_errors();
+        libxml_use_internal_errors( $previousUseInternalErrors );
+
+        return $output;
+    }
+    public static function onImagePageFindFile( $page, &$file, &$displayFile ): void {
+        $title = method_exists( $page, 'getTitle' ) ? $page->getTitle() : null;
+        if ( !$title instanceof Title || !$title->inNamespace( NS_FILE ) ) {
+            return;
+        }
+
+        $services = MediaWikiServices::getInstance();
+        $file = self::resolveRepoFile( $services, $title );
+        if ( !$file instanceof File || !$file->exists() ) {
+            return;
+        }
+
+        $user = RequestContext::getMain()->getUser();
+        if (
+            !$user instanceof User
+            || !self::shouldUsePlaceholderReplacement( $services, $title, $user )
+        ) {
+            return;
+        }
+
+        $placeholderFile = self::resolvePlaceholderFile( $services );
+        if ( $placeholderFile ) {
+            $displayFile = $placeholderFile;
+        }
+    }
+
+    public static function onImgAuthModifyHeaders( $title, &$headers ): void {
+        $fileTitle = Title::newFromLinkTarget( $title );
+        if ( !$fileTitle || !$fileTitle->inNamespace( NS_FILE ) ) {
+            return;
+        }
+
+        if ( self::isFileTitleMarkedNSFW( $fileTitle ) ) {
+            self::addNsfwRobotsHeader( $headers );
+        }
     }
 
 
@@ -784,6 +730,22 @@ class Hooks {
             && (bool)$services->getUserOptionsLookup()->getOption( $user, self::OPT_UNBLUR );
     }
 
+    private static function userCanViewOriginalNsfwFile( MediaWikiServices $services, User $user ): bool {
+        // Reuse the extension's existing NSFW visibility decision so img_auth
+        // and the NSFW proxy follow the same age/right/preference gates as page rendering.
+        return self::userWantsUnblur( $services, $user );
+    }
+
+    private static function shouldUsePlaceholderReplacement(
+        MediaWikiServices $services,
+        Title $fileTitle,
+        User $user
+    ): bool {
+        return $fileTitle->inNamespace( NS_FILE )
+            && self::isFileTitleMarkedNSFW( $fileTitle )
+            && !self::userCanViewOriginalNsfwFile( $services, $user );
+    }
+
     /* ============================================================
      *  NSFW DETECTION (MARKER OR CATEGORY)
      * ========================================================== */
@@ -821,32 +783,8 @@ class Hooks {
             // Never break rendering because a parser/text read failed
         }
 
-        // 2) Category:NSFW membership (MW 1.45 schema: categorylinks + linktarget)
-        $pageId = $fileTitle->getArticleID();
-        if ( !$pageId ) {
-            return $memo[$cacheKey] = false;
-        }
-
-        try {
-            $dbr = $services->getConnectionProvider()->getReplicaDatabase();
-
-            $row = $dbr->newSelectQueryBuilder()
-                ->select( [ 'cl_from' ] )
-                ->from( 'categorylinks' )
-                ->join( 'linktarget', 'lt', 'lt.lt_id = cl_target_id' )
-                ->where( [
-                    'cl_from'      => (int)$pageId,
-                    'lt.lt_namespace' => NS_CATEGORY,
-                    'lt.lt_title'     => self::NSFW_CATEGORY_DBKEY, // DB key: "NSFW"
-                ] )
-                ->limit( 1 )
-                ->caller( __METHOD__ )
-                ->fetchRow();
-
-            return $memo[$cacheKey] = (bool)$row;
-        } catch ( \Throwable $e ) {
-            return $memo[$cacheKey] = false;
-        }
+        return $memo[$cacheKey] = self::titleHasCategory( $fileTitle, self::NSFW_FILE_CATEGORY_DBKEY )
+            || self::titleHasCategory( $fileTitle, self::NSFW_CATEGORY_DBKEY );
     }
 
 
@@ -863,13 +801,34 @@ class Hooks {
             return $memo[$cacheKey];
         }
 
-        $services = MediaWikiServices::getInstance();
         $pageId = $title->getArticleID();
         if ( !$pageId ) {
             return $memo[$cacheKey] = false;
         }
 
+        return $memo[$cacheKey] = self::titleHasCategory( $title, self::NSFW_CATEGORY_DBKEY );
+    }
+
+    private static function titleHasCategory( Title $title, string $categoryDbKey ): bool {
+        static $memo = [];
+
+        $pageId = $title->getArticleID();
+        if ( !$pageId ) {
+            return false;
+        }
+
+        $normalizedCategoryDbKey = self::normalizeCategoryDbKey( $categoryDbKey );
+        if ( $normalizedCategoryDbKey === null ) {
+            return false;
+        }
+
+        $cacheKey = $title->getPrefixedDBkey() . '|' . $normalizedCategoryDbKey;
+        if ( array_key_exists( $cacheKey, $memo ) ) {
+            return $memo[$cacheKey];
+        }
+
         try {
+            $services = MediaWikiServices::getInstance();
             $dbr = $services->getConnectionProvider()->getReplicaDatabase();
             $row = $dbr->newSelectQueryBuilder()
                 ->select( [ 'cl_from' ] )
@@ -878,7 +837,7 @@ class Hooks {
                 ->where( [
                     'cl_from' => (int)$pageId,
                     'lt.lt_namespace' => NS_CATEGORY,
-                    'lt.lt_title' => self::NSFW_CATEGORY_DBKEY,
+                    'lt.lt_title' => $normalizedCategoryDbKey,
                 ] )
                 ->limit( 1 )
                 ->caller( __METHOD__ )
@@ -890,20 +849,23 @@ class Hooks {
         }
     }
 
+    private static function normalizeCategoryDbKey( string $categoryName ): ?string {
+        $categoryName = trim( str_replace( '_', ' ', $categoryName ) );
+        if ( $categoryName === '' ) {
+            return null;
+        }
+
+        $categoryTitle = Title::newFromText( ltrim( $categoryName, ':' ), NS_CATEGORY );
+        if ( !$categoryTitle || !$categoryTitle->inNamespace( NS_CATEGORY ) ) {
+            return null;
+        }
+
+        return $categoryTitle->getDBkey();
+    }
+
     private static function applyFilePageBlurClass( OutputPage $out, bool $userWantsUnblur ): void {
-        $title = $out->getTitle();
-        if ( !$title || !$title->inNamespace( NS_FILE ) ) {
-            return;
-        }
-
-        if ( $userWantsUnblur ) {
-            return;
-        }
-
-        if ( self::isFileTitleMarkedNSFW( $title ) ) {
-            $out->addBodyClasses( 'nsfw-filepage-blur' );
-            $out->addJsConfigVars( 'wgNSFWFilePage', true );
-        }
+        // File pages now rely on the NSFW proxy instead of adding client-side
+        // blur classes around the rendered image.
     }
 
     /* ============================================================
@@ -937,25 +899,798 @@ class Hooks {
         return wfMessage( 'nsfwblur-pref-nsfw-access' )->text();
     }
 
+    private static function resolvePlaceholderFile( MediaWikiServices $services ): ?File {
+        $placeholderTitle = self::resolvePlaceholderTitle( $services );
+        if ( !$placeholderTitle || self::isFileTitleMarkedNSFW( $placeholderTitle ) ) {
+            return null;
+        }
+
+        $file = $services->getRepoGroup()->getLocalRepo()->newFile( $placeholderTitle->getDBkey() );
+        if ( !$file || !$file->exists() || !$file->getPath() ) {
+            return null;
+        }
+
+        return $file;
+    }
+
+    private static function resolvePlaceholderTitle( MediaWikiServices $services ): ?Title {
+        $configured = trim( (string)$services->getMainConfig()->get( self::PLACEHOLDER_CONFIG ) );
+        if ( $configured === '' ) {
+            return null;
+        }
+
+        $title = Title::newFromText( ltrim( $configured, ':' ), NS_FILE );
+        if ( !$title || !$title->inNamespace( NS_FILE ) ) {
+            return null;
+        }
+
+        return $title;
+    }
+
+    private static function resolveRepoFile( MediaWikiServices $services, Title $fileTitle ): ?File {
+        $file = $services->getRepoGroup()->findFile( $fileTitle );
+        if ( !$file ) {
+            $file = $services->getRepoGroup()->getLocalRepo()->newFile( $fileTitle );
+        }
+
+        return $file instanceof File ? $file : null;
+    }
+
+    private static function streamProxyFile(
+        File $streamFile,
+        array $transformParams,
+        bool $isNsfwResponse
+    ): void {
+        $headers = self::buildProxySuccessHeaders( $streamFile->getName(), $isNsfwResponse );
+
+        if ( $transformParams !== [] ) {
+            $thumb = $streamFile->transform( $transformParams, File::RENDER_NOW );
+            if ( $thumb instanceof \MediaTransformOutput && !$thumb->isError() ) {
+                $rawHeaders = self::buildRawStreamHeaders( $headers );
+                $thumb->streamFileWithStatus( $rawHeaders );
+                exit;
+            }
+        }
+
+        [ $rawHeaders, $options ] = HTTPFileStreamer::preprocessHeaders( $headers );
+        $streamPath = $streamFile->getPath();
+        if ( !$streamPath ) {
+            self::emitProxyError( 404, 'File is not available for streaming.', $isNsfwResponse );
+        }
+
+        $streamFile->getRepo()->streamFileWithStatus( $streamPath, $rawHeaders, $options );
+        exit;
+    }
+
+    private static function buildProxySuccessHeaders( string $filename, bool $isNsfwResponse ): array {
+        $request = RequestContext::getMain()->getRequest();
+        $headers = [
+            'Cache-Control' => 'private',
+            'Vary' => 'Cookie',
+        ];
+
+        if ( $isNsfwResponse ) {
+            self::addNsfwRobotsHeader( $headers );
+        }
+
+        $range = $request->getHeader( 'Range' );
+        if ( is_string( $range ) && $range !== '' ) {
+            $headers['Range'] = $range;
+        }
+
+        $ims = $request->getHeader( 'If-Modified-Since' );
+        if ( is_string( $ims ) && $ims !== '' ) {
+            $headers['If-Modified-Since'] = $ims;
+        }
+
+        if ( $request->getCheck( 'download' ) ) {
+            $headers['Content-Disposition'] = 'attachment';
+        }
+
+        $cspHeader = ContentSecurityPolicy::getMediaHeader( $filename );
+        if ( $cspHeader ) {
+            $headers['Content-Security-Policy'] = $cspHeader;
+        }
+
+        return $headers;
+    }
+
+    private static function buildRawStreamHeaders( array $headers ): array {
+        unset( $headers['Range'], $headers['If-Modified-Since'] );
+
+        return array_values( array_map(
+            static function ( string $name, string $value ): string {
+                return $name . ': ' . $value;
+            },
+            array_keys( $headers ),
+            array_values( $headers )
+        ) );
+    }
+
+    private static function resolveProxyRequestTitle(): ?Title {
+        $request = RequestContext::getMain()->getRequest();
+
+        $titleText = trim( rawurldecode( (string)$request->getVal( 'title', '' ) ) );
+        if ( $titleText !== '' ) {
+            $title = Title::newFromText( ltrim( $titleText, ':' ) );
+            if ( !$title || !$title->inNamespace( NS_FILE ) ) {
+                $title = Title::newFromText( ltrim( $titleText, ':' ), NS_FILE );
+            }
+            if ( $title && $title->inNamespace( NS_FILE ) ) {
+                return $title;
+            }
+        }
+
+        $nameText = trim( rawurldecode( (string)$request->getVal( 'name', $request->getVal( 'file', '' ) ) ) );
+        if ( $nameText === '' ) {
+            return null;
+        }
+
+        $nameText = preg_replace( '/^:?\s*(?:File|Image):/i', '', $nameText );
+        $title = Title::newFromText( $nameText, NS_FILE );
+        if ( !$title || !$title->inNamespace( NS_FILE ) ) {
+            return null;
+        }
+
+        return $title;
+    }
+
+    private static function extractTransformParamsFromRequest(): array {
+        $request = RequestContext::getMain()->getRequest();
+
+        return self::sanitizeTransformParams( [
+            'width' => $request->getInt( 'width', 0 ),
+            'height' => $request->getInt( 'height', 0 ),
+            'page' => $request->getInt( 'page', 0 ),
+        ] );
+    }
+
+    private static function extractTransformParamsFromHandlerParams( array $handlerParams ): array {
+        return self::sanitizeTransformParams( [
+            'width' => $handlerParams['width'] ?? 0,
+            'height' => $handlerParams['height'] ?? 0,
+            'page' => $handlerParams['page'] ?? 0,
+        ] );
+    }
+
+    private static function extractTransformParamsFromRenderedAttributes( array $attribs ): array {
+        $params = [];
+
+        if ( isset( $attribs['src'] ) && is_string( $attribs['src'] ) ) {
+            $params = self::extractTransformParamsFromUrl( $attribs['src'] );
+        }
+
+        if ( isset( $attribs['width'] ) && ctype_digit( (string)$attribs['width'] ) ) {
+            $params['width'] = (int)$attribs['width'];
+        }
+
+        if ( isset( $attribs['height'] ) && ctype_digit( (string)$attribs['height'] ) ) {
+            $params['height'] = (int)$attribs['height'];
+        }
+
+        return self::sanitizeTransformParams( $params );
+    }
+
+    private static function extractTransformParamsFromUrl( string $url ): array {
+        $decodedUrl = html_entity_decode( $url, ENT_QUOTES );
+        $parts = parse_url( $decodedUrl );
+        if ( !is_array( $parts ) ) {
+            return [];
+        }
+
+        $params = [];
+
+        if ( isset( $parts['query'] ) ) {
+            parse_str( $parts['query'], $queryParams );
+            $params['width'] = isset( $queryParams['width'] ) ? (int)$queryParams['width'] : 0;
+            $params['height'] = isset( $queryParams['height'] ) ? (int)$queryParams['height'] : 0;
+            $params['page'] = isset( $queryParams['page'] ) ? (int)$queryParams['page'] : 0;
+        }
+
+        $path = rawurldecode( $parts['path'] ?? '' );
+        if ( $path !== '' ) {
+            $basename = wfBaseName( $path );
+
+            if ( preg_match( '/(?:^|-)page(\d+)-/i', $basename, $m ) ) {
+                $params['page'] = (int)$m[1];
+            }
+
+            if ( preg_match( '/(?:^|-)(\d+)px-/i', $basename, $m ) ) {
+                $params['width'] = (int)$m[1];
+            }
+        }
+
+        return self::sanitizeTransformParams( $params );
+    }
+
+    private static function sanitizeTransformParams( array $params ): array {
+        $sanitized = [];
+
+        foreach ( [ 'width', 'height', 'page' ] as $key ) {
+            if ( !isset( $params[$key] ) ) {
+                continue;
+            }
+
+            $value = (int)$params[$key];
+            if ( $value > 0 ) {
+                $sanitized[$key] = $value;
+            }
+        }
+
+        return $sanitized;
+    }
+
+    private static function addNsfwRobotsHeader( array &$headers ): void {
+        $headers['X-Robots-Tag'] = self::NSFW_ROBOTS_TAG;
+    }
+
+    private static function emitNsfwRobotsHeader(): void {
+        header( 'X-Robots-Tag: ' . self::NSFW_ROBOTS_TAG );
+    }
+
+    private static function emitProxyError( int $statusCode, string $message, bool $isNsfwResponse = false ): void {
+        if ( $isNsfwResponse ) {
+            self::emitNsfwRobotsHeader();
+        }
+
+        http_response_code( $statusCode );
+        header( 'Content-Type: text/plain; charset=UTF-8' );
+        echo $message;
+        exit;
+    }
+
+    private static function normalizeRenderedFileTitle( $title, $file = null ): ?Title {
+        if ( $title instanceof Title && $title->inNamespace( NS_FILE ) ) {
+            return $title;
+        }
+
+        if ( $file instanceof File ) {
+            $fileTitle = $file->getTitle();
+            if ( $fileTitle instanceof Title && $fileTitle->inNamespace( NS_FILE ) ) {
+                return $fileTitle;
+            }
+        }
+
+        return null;
+    }
+
+    private static function resolveRenderedNsfwFileTitle( File $file ): ?Title {
+        $fileTitle = self::normalizeRenderedFileTitle( $file->getTitle(), $file );
+        if ( $fileTitle && self::isFileTitleMarkedNSFW( $fileTitle ) ) {
+            return $fileTitle;
+        }
+
+        $currentTitle = RequestContext::getMain()->getTitle();
+        if ( !$currentTitle instanceof Title || !$currentTitle->inNamespace( NS_FILE ) ) {
+            return $fileTitle;
+        }
+
+        $currentTitleIsNsfw = self::isFileTitleMarkedNSFW( $currentTitle );
+        if ( !$currentTitleIsNsfw ) {
+            return $fileTitle;
+        }
+
+        $placeholderTitle = self::resolvePlaceholderTitle( MediaWikiServices::getInstance() );
+        if (
+            $placeholderTitle
+            && $fileTitle
+            && $fileTitle->equals( $placeholderTitle )
+            && $currentTitleIsNsfw
+        ) {
+            return $currentTitle;
+        }
+
+        return $fileTitle;
+    }
+
+    private static function buildProxyUrlForFileTitle( Title $fileTitle, array $transformParams = [] ): string {
+        $services = MediaWikiServices::getInstance();
+        $query = [ 'title' => $fileTitle->getPrefixedDBkey() ];
+
+        foreach ( self::sanitizeTransformParams( $transformParams ) as $key => $value ) {
+            $query[$key] = $value;
+        }
+
+        return wfAppendQuery( self::getProxyScriptUrl( $services ), $query );
+    }
+
+    private static function getProxyScriptUrl( MediaWikiServices $services ): string {
+        return rtrim( (string)$services->getMainConfig()->get( 'ExtensionAssetsPath' ), '/' )
+            . '/NsfwFilter/'
+            . self::PROXY_ENTRY_POINT;
+    }
+
+    private static function rewriteProxySrcSet(
+        string $srcset,
+        Title $fileTitle,
+        array $baseParams
+    ): string {
+        $entries = array_filter( array_map( 'trim', explode( ',', $srcset ) ) );
+        $rewritten = [];
+
+        foreach ( $entries as $entry ) {
+            if ( !preg_match( '/^(\S+)(?:\s+([0-9.]+)(x|w))?$/', $entry, $m ) ) {
+                $rewritten[] = $entry;
+                continue;
+            }
+
+            $params = $baseParams ?: self::extractTransformParamsFromUrl( $m[1] );
+            if ( isset( $m[2], $m[3] ) ) {
+                if ( $m[3] === 'x' && isset( $baseParams['width'] ) ) {
+                    $params['width'] = max( 1, (int)round( $baseParams['width'] * (float)$m[2] ) );
+                } elseif ( $m[3] === 'w' ) {
+                    $params['width'] = max( 1, (int)round( (float)$m[2] ) );
+                }
+            }
+
+            $descriptor = isset( $m[2], $m[3] ) ? ' ' . $m[2] . $m[3] : '';
+            $rewritten[] = self::buildProxyUrlForFileTitle( $fileTitle, $params ) . $descriptor;
+        }
+
+        return implode( ', ', $rewritten );
+    }
+
+    private static function shouldRewriteRenderedFileHref( string $href, File $file ): bool {
+        return self::urlPathMatches( $href, $file->getUrl() );
+    }
+
+    private static function urlPathMatches( string $left, string $right ): bool {
+        if ( $left === '' || $right === '' ) {
+            return false;
+        }
+
+        $leftPath = rawurldecode( (string)( parse_url( html_entity_decode( $left, ENT_QUOTES ), PHP_URL_PATH ) ?? '' ) );
+        $rightPath = rawurldecode( (string)( parse_url( html_entity_decode( $right, ENT_QUOTES ), PHP_URL_PATH ) ?? '' ) );
+
+        if ( $leftPath === '' || $rightPath === '' ) {
+            return false;
+        }
+
+        return $leftPath === $rightPath;
+    }
+
+    private static function rewriteNsfwFilePageSizeLinks( string $text, Title $fileTitle ): string {
+        return (string)preg_replace_callback(
+            '/<a\b[^>]*>/i',
+            static function ( array $matches ) use ( $fileTitle ): string {
+                $tag = $matches[0];
+                if ( !preg_match( '/\bclass="([^"]*\bmw-thumbnail-link\b[^"]*)"/i', $tag ) ) {
+                    return $tag;
+                }
+
+                if ( !preg_match( '/\bhref="([^"]+)"/i', $tag, $hrefMatch ) ) {
+                    return $tag;
+                }
+
+                $params = self::extractTransformParamsFromUrl( $hrefMatch[1] );
+                $proxyUrl = htmlspecialchars(
+                    self::buildProxyUrlForFileTitle( $fileTitle, $params ),
+                    ENT_QUOTES
+                );
+
+                return (string)preg_replace(
+                    '/\bhref="[^"]+"/i',
+                    'href="' . $proxyUrl . '"',
+                    $tag,
+                    1
+                );
+            },
+            $text
+        );
+    }
+
+    private static function rewriteNsfwImgAuthUrlsInHtml( string $html ): string {
+        if ( $html === '' || stripos( $html, 'img_auth.php' ) === false ) {
+            return $html;
+        }
+
+        $html = (string)preg_replace_callback(
+            '/\b(?P<name>srcset)\s*=\s*(?P<quote>["\'])(?P<value>.*?)(?P=quote)/is',
+            static function ( array $matches ): string {
+                $rewritten = self::rewriteNsfwImgAuthSrcSetAttributeValue( $matches['value'] );
+                if ( $rewritten === $matches['value'] ) {
+                    return $matches[0];
+                }
+
+                return $matches['name']
+                    . '='
+                    . $matches['quote']
+                    . htmlspecialchars( $rewritten, ENT_QUOTES )
+                    . $matches['quote'];
+            },
+            $html
+        );
+
+        return (string)preg_replace_callback(
+            '/\b(?P<name>src|data-src|href)\s*=\s*(?P<quote>["\'])(?P<value>.*?)(?P=quote)/is',
+            static function ( array $matches ): string {
+                $rewritten = self::rewriteNsfwImgAuthAttributeUrl(
+                    strtolower( $matches['name'] ),
+                    $matches['value']
+                );
+                if ( $rewritten === $matches['value'] ) {
+                    return $matches[0];
+                }
+
+                return $matches['name']
+                    . '='
+                    . $matches['quote']
+                    . htmlspecialchars( $rewritten, ENT_QUOTES )
+                    . $matches['quote'];
+            },
+            $html
+        );
+    }
+
+    private static function rewriteNsfwImgAuthSrcSetAttributeValue( string $srcset ): string {
+        $decodedSrcSet = html_entity_decode( $srcset, ENT_QUOTES );
+        $entries = array_filter( array_map( 'trim', explode( ',', $decodedSrcSet ) ) );
+        if ( $entries === [] ) {
+            return $srcset;
+        }
+
+        foreach ( $entries as $entry ) {
+            if ( !preg_match( '/^(\S+)/', $entry, $m ) ) {
+                continue;
+            }
+
+            $fileTitle = self::resolveNsfwFileTitleFromImgAuthUrl( $m[1], 'srcset' );
+            if ( !$fileTitle ) {
+                continue;
+            }
+
+            return self::rewriteProxySrcSet(
+                $decodedSrcSet,
+                $fileTitle,
+                self::extractTransformParamsFromUrl( $m[1] )
+            );
+        }
+
+        return $srcset;
+    }
+
+    private static function rewriteNsfwImgAuthAttributeUrl( string $attributeName, string $url ): string {
+        $decodedUrl = html_entity_decode( $url, ENT_QUOTES );
+        $fileTitle = self::resolveNsfwFileTitleFromImgAuthUrl( $decodedUrl, $attributeName );
+        if ( !$fileTitle ) {
+            return $url;
+        }
+
+        $proxyUrl = self::buildProxyUrlForFileTitle(
+            $fileTitle,
+            self::extractTransformParamsFromUrl( $decodedUrl )
+        );
+
+        if ( self::urlHasDownloadQuery( $decodedUrl ) ) {
+            $proxyUrl = wfAppendQuery( $proxyUrl, [ 'download' => 1 ] );
+        }
+
+        return $proxyUrl;
+    }
+
+    private static function resolveNsfwFileTitleFromImgAuthUrl( string $url, string $attributeName ): ?Title {
+        if (
+            $url === ''
+            || self::isProxyMediaUrl( $url )
+            || !self::isImgAuthUrl( $url )
+        ) {
+            return null;
+        }
+
+        $dbKey = self::extractImageDbKeyFromImgAuthUrl( $url );
+        if ( !$dbKey ) {
+            return null;
+        }
+
+        $title = Title::newFromText( $dbKey, NS_FILE );
+        if ( !$title || !$title->inNamespace( NS_FILE ) ) {
+            return null;
+        }
+
+        $file = self::resolveRepoFile( MediaWikiServices::getInstance(), $title );
+        if ( !$file || !$file->exists() ) {
+            return null;
+        }
+
+        if ( $attributeName === 'href' && !self::shouldRewriteRenderedFileHref( $url, $file ) ) {
+            return null;
+        }
+
+        return self::isFileTitleMarkedNSFW( $title ) ? $title : null;
+    }
+
+    private static function isImgAuthUrl( string $url ): bool {
+        $path = (string)( parse_url( html_entity_decode( $url, ENT_QUOTES ), PHP_URL_PATH ) ?? '' );
+        return $path !== '' && (bool)preg_match( '#/img_auth\.php(?:/|$)#i', rawurldecode( $path ) );
+    }
+
+    private static function extractImageDbKeyFromImgAuthUrl( string $url ): ?string {
+        if ( stripos( $url, 'img_auth.php' ) === false ) {
+            return null;
+        }
+
+        $path = parse_url( $url, PHP_URL_PATH );
+        if ( !$path ) {
+            return null;
+        }
+
+        $path = urldecode( $path );
+
+        if ( preg_match(
+            '#img_auth\.php/(?:thumb/)?[0-9a-f]/[0-9a-f]{2}/([^/]+)#i',
+            $path,
+            $matches
+        ) ) {
+            return str_replace( ' ', '_', $matches[1] );
+        }
+
+        return null;
+    }
+
+    private static function rewriteNsfwMediaUrlsInHtml( string $html ): string {
+        if ( $html === '' ) {
+            return $html;
+        }
+
+        $nsfwFileTitles = self::collectNsfwFileTitlesFromHtml( $html );
+
+        $html = (string)preg_replace_callback(
+            '/\b(?P<name>srcset)\s*=\s*(?P<quote>["\'])(?P<value>.*?)(?P=quote)/is',
+            static function ( array $matches ) use ( $nsfwFileTitles ): string {
+                $rewritten = self::rewriteNsfwSrcSetAttributeValue( $matches['value'], $nsfwFileTitles );
+                if ( $rewritten === $matches['value'] ) {
+                    return $matches[0];
+                }
+
+                return $matches['name']
+                    . '='
+                    . $matches['quote']
+                    . htmlspecialchars( $rewritten, ENT_QUOTES )
+                    . $matches['quote'];
+            },
+            $html
+        );
+
+        $html = (string)preg_replace_callback(
+            '/\b(?P<name>src|data-src|href)\s*=\s*(?P<quote>["\'])(?P<value>.*?)(?P=quote)/is',
+            static function ( array $matches ) use ( $nsfwFileTitles ): string {
+                $rewritten = self::rewriteNsfwMediaAttributeUrl(
+                    strtolower( $matches['name'] ),
+                    $matches['value'],
+                    $nsfwFileTitles
+                );
+                if ( $rewritten === $matches['value'] ) {
+                    return $matches[0];
+                }
+
+                return $matches['name']
+                    . '='
+                    . $matches['quote']
+                    . htmlspecialchars( $rewritten, ENT_QUOTES )
+                    . $matches['quote'];
+            },
+            $html
+        );
+
+        return (string)preg_replace_callback(
+            '/\b(?P<name>style)\s*=\s*(?P<quote>["\'])(?P<value>.*?)(?P=quote)/is',
+            static function ( array $matches ) use ( $nsfwFileTitles ): string {
+                $rewritten = self::rewriteNsfwBackgroundImageStyleUrls( $matches['value'], $nsfwFileTitles );
+                if ( $rewritten === $matches['value'] ) {
+                    return $matches[0];
+                }
+
+                return $matches['name']
+                    . '='
+                    . $matches['quote']
+                    . $rewritten
+                    . $matches['quote'];
+            },
+            $html
+        );
+    }
+
+    private static function collectNsfwFileTitlesFromHtml( string $html ): array {
+        $services = MediaWikiServices::getInstance();
+        $titles = [];
+
+        foreach ( self::extractImageDbKeysFromHtml( $html ) as $dbKey ) {
+            $title = Title::newFromText( $dbKey, NS_FILE );
+            if ( !$title || !$title->inNamespace( NS_FILE ) ) {
+                continue;
+            }
+
+            $file = self::resolveRepoFile( $services, $title );
+            if ( !$file || !$file->exists() || !self::isFileTitleMarkedNSFW( $title ) ) {
+                continue;
+            }
+
+            $titles[$title->getDBkey()] = $title;
+        }
+
+        return $titles;
+    }
+
+    private static function rewriteNsfwSrcSetAttributeValue( string $srcset, array $nsfwFileTitles ): string {
+        $entries = array_filter( array_map( 'trim', explode( ',', html_entity_decode( $srcset, ENT_QUOTES ) ) ) );
+        if ( $entries === [] ) {
+            return $srcset;
+        }
+
+        foreach ( $entries as $entry ) {
+            if ( !preg_match( '/^(\S+)/', $entry, $m ) ) {
+                continue;
+            }
+
+            $fileTitle = self::resolveNsfwFileTitleFromRenderedUrl( $m[1], $nsfwFileTitles, 'srcset' );
+            if ( !$fileTitle ) {
+                continue;
+            }
+
+            return self::rewriteProxySrcSet(
+                html_entity_decode( $srcset, ENT_QUOTES ),
+                $fileTitle,
+                self::extractTransformParamsFromUrl( $m[1] )
+            );
+        }
+
+        return $srcset;
+    }
+
+    private static function rewriteNsfwMediaAttributeUrl(
+        string $attributeName,
+        string $url,
+        array $nsfwFileTitles
+    ): string {
+        $decodedUrl = html_entity_decode( $url, ENT_QUOTES );
+        $fileTitle = self::resolveNsfwFileTitleFromRenderedUrl( $decodedUrl, $nsfwFileTitles, $attributeName );
+        if ( !$fileTitle ) {
+            return $url;
+        }
+
+        $proxyUrl = self::buildProxyUrlForFileTitle(
+            $fileTitle,
+            self::extractTransformParamsFromUrl( $decodedUrl )
+        );
+
+        if ( self::urlHasDownloadQuery( $decodedUrl ) ) {
+            $proxyUrl = wfAppendQuery( $proxyUrl, [ 'download' => 1 ] );
+        }
+
+        return $proxyUrl;
+    }
+
+    private static function rewriteNsfwBackgroundImageStyleUrls( string $style, array $nsfwFileTitles ): string {
+        return (string)preg_replace_callback(
+            '/background-image\s*:\s*url\(\s*(["\']?)([^)\'"]+)\1\s*\)/i',
+            static function ( array $matches ) use ( $nsfwFileTitles ): string {
+                $rewrittenUrl = self::rewriteNsfwMediaAttributeUrl( 'style', $matches[2], $nsfwFileTitles );
+                if ( $rewrittenUrl === $matches[2] ) {
+                    return $matches[0];
+                }
+
+                $quote = $matches[1];
+                return 'background-image: url('
+                    . $quote
+                    . htmlspecialchars( $rewrittenUrl, ENT_QUOTES )
+                    . $quote
+                    . ')';
+            },
+            $style
+        );
+    }
+
+    private static function resolveNsfwFileTitleFromRenderedUrl(
+        string $url,
+        array $nsfwFileTitles,
+        string $attributeName
+    ): ?Title {
+        if (
+            $url === ''
+            || self::isProxyMediaUrl( $url )
+            || !self::isRewritableRenderedMediaUrl( $url, $attributeName )
+        ) {
+            return null;
+        }
+
+        $dbKey = self::extractImageDbKeyFromUrl( $url );
+        if ( !$dbKey || !isset( $nsfwFileTitles[$dbKey] ) ) {
+            return null;
+        }
+
+        return $nsfwFileTitles[$dbKey];
+    }
+
+    private static function isProxyMediaUrl( string $url ): bool {
+        return self::urlPathMatches( $url, self::getProxyScriptUrl( MediaWikiServices::getInstance() ) );
+    }
+
+    private static function isRewritableRenderedMediaUrl( string $url, string $attributeName ): bool {
+        $parts = parse_url( html_entity_decode( $url, ENT_QUOTES ) );
+        if ( !is_array( $parts ) ) {
+            return false;
+        }
+
+        $path = rawurldecode( (string)( $parts['path'] ?? '' ) );
+        $query = (string)( $parts['query'] ?? '' );
+
+        if ( $path === '' && $query === '' ) {
+            return false;
+        }
+
+        $hasMediaPath = (bool)preg_match( '#/(?:img_auth\.php|images/|thumb/|transcoded/)#i', $path );
+        $isFilePageUrl = (bool)preg_match( '#/wiki/File:#i', $path )
+            || ( !$hasMediaPath && preg_match( '/(?:^|[?&])title=File:/i', $query ) );
+
+        if ( $attributeName === 'href' && $isFilePageUrl ) {
+            return false;
+        }
+
+        return $hasMediaPath || $isFilePageUrl || preg_match( '/(?:^|[?&])title=(?:File:)?[^&]+\.[a-z0-9]{2,5}/i', $query );
+    }
+
+    private static function extractImageDbKeyFromUrl( string $url ): ?string {
+        $decodedUrl = html_entity_decode( $url, ENT_QUOTES );
+        $parts = parse_url( $decodedUrl );
+        if ( !is_array( $parts ) ) {
+            return null;
+        }
+
+        if ( isset( $parts['query'] ) ) {
+            parse_str( $parts['query'], $queryParams );
+            if ( isset( $queryParams['title'] ) ) {
+                $dbKey = self::normalizeDbKeyFromMaybeUrlOrName( (string)$queryParams['title'] );
+                if ( self::isPlausibleFileDbKey( $dbKey ) ) {
+                    return $dbKey;
+                }
+            }
+        }
+
+        $path = rawurldecode( (string)( $parts['path'] ?? '' ) );
+        if ( $path === '' ) {
+            return null;
+        }
+
+        $patterns = [
+            '#/thumb/[^/]+/[^/]+/([^/"\'\?#]+\.[a-z0-9]{2,5})/#i',
+            '#/wiki/File:([^/"\'\?#]+?\.[a-z0-9]{2,5})#i',
+            '#/([^/"\'\?#]+\.[a-z0-9]{2,5})$#i',
+        ];
+
+        foreach ( $patterns as $pattern ) {
+            if ( preg_match( $pattern, $path, $m ) ) {
+                $dbKey = self::normalizeDbKeyFromMaybeUrlOrName( $m[1] );
+                if ( self::isPlausibleFileDbKey( $dbKey ) ) {
+                    return $dbKey;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static function isPlausibleFileDbKey( ?string $dbKey ): bool {
+        return is_string( $dbKey )
+            && $dbKey !== ''
+            && (bool)preg_match( '/\.[a-z0-9]{2,5}$/i', $dbKey );
+    }
+
+    private static function urlHasDownloadQuery( string $url ): bool {
+        $parts = parse_url( html_entity_decode( $url, ENT_QUOTES ) );
+        if ( !is_array( $parts ) || !isset( $parts['query'] ) ) {
+            return false;
+        }
+
+        parse_str( $parts['query'], $queryParams );
+        return !empty( $queryParams['download'] );
+    }
+
     /* ============================================================
      *  CSS
      * ========================================================== */
 
     private static function getEarlyInlineCss(): string {
         return <<<'CSS'
-.nsfw-blur img,
-.nsfw-blur .mw-file-element,
-img.nsfw-blur {
-    filter: blur(24px) !important;
-}
-
-body.nsfw-filepage-blur #file img,
-body.nsfw-filepage-blur #file .mw-file-element,
-body.nsfw-filepage-blur .fullImageLink img,
-body.nsfw-filepage-blur .mw-filepage-other-resolutions img {
-    filter: blur(24px) !important;
-}
-
 body.nsfw-page-restricted .nsfw-page-restriction {
     margin: 1.5rem auto;
     max-width: 48rem;
@@ -969,15 +1704,6 @@ body.nsfw-page-restricted .nsfw-page-restriction__body,
 body.nsfw-page-restricted .nsfw-page-restriction__actions,
 body.nsfw-page-restricted .nsfw-page-restriction__tip {
     margin: 0 0 0.75rem;
-}
-
-body.nsfw-mmv-preblur .mw-mmv-image img,
-body.nsfw-mmv-preblur img.mw-mmv-final-image {
-    filter: blur(24px) !important;
-}
-
-.nsfw-blur img {
-    transition: none !important;
 }
 CSS;
     }
