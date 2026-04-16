@@ -55,6 +55,8 @@
         "ParserOutput": "NsfwFilter\\Hooks::onParserOutput",
 
         "SpecialPageBeforeExecute": "NsfwFilter\\Hooks::onSpecialPageBeforeExecute",
+        "SpecialSearchResultsAppend": "NsfwFilter\\Hooks::onSpecialSearchResultsAppend",
+        "SearchResultProvideThumbnail": "NsfwFilter\\Hooks::onSearchResultProvideThumbnail",
 
         "ImageBeforeProduceHTML": "NsfwFilter\\Hooks::onImageBeforeProduceHTML",
         "ImagePageFindFile": "NsfwFilter\\Hooks::onImagePageFindFile",

@@ -33,6 +33,8 @@
 
   const userWantsUnblur = isTruthy(mw.config.get('wgNSFWUnblur'));
   const nsfwList = mw.config.get('wgNSFWFilesOnPage') || [];
+  const placeholderImageUrl = mw.config.get('wgNSFWPlaceholderImageUrl') || null;
+  const proxyScriptUrl = mw.config.get('wgNSFWProxyScriptUrl') || null;
 
   const nsfwSet = new Set(nsfwList.map(normalizeFileTitle).filter(Boolean));
   console.log('[NSFW] files on page:', mw.config.get('wgNSFWFilesOnPage'));
@@ -226,9 +228,49 @@
     });
   }
 
+  function buildProxyThumbUrl(title, width) {
+    if (!proxyScriptUrl || !title || !width) return null;
+
+    const uri = new mw.Uri(proxyScriptUrl);
+    uri.query.title = title;
+    uri.query.width = String(width);
+    return uri.toString();
+  }
+
+  function rewriteSearchResultThumb(img) {
+    if (!img || img.dataset.nsfwProxyApplied === '1') return;
+
+    const title = resolveFileTitleFromImg(img);
+    if (!title) return;
+
+    const src = buildProxyThumbUrl(title, 320);
+    const src2x = buildProxyThumbUrl(title, 640);
+    if (!src || !src2x) return;
+
+    img.src = src;
+    img.srcset = `${src} 1x, ${src2x} 2x`;
+
+    if (img.hasAttribute('data-src')) {
+      img.setAttribute('data-src', src);
+    }
+
+    if (img.hasAttribute('data-srcset')) {
+      img.setAttribute('data-srcset', img.srcset);
+    }
+
+    img.dataset.nsfwProxyApplied = '1';
+  }
+
+  function applySearchResultPlaceholders(root = document) {
+    root.querySelectorAll('img.mw-search-result-thumb, .mw-search-result-thumb img').forEach((img) => {
+      rewriteSearchResultThumb(img);
+    });
+  }
+
   function scan(root = document) {
     root.querySelectorAll('img').forEach(markImageIfNSFW);
     propagateBlurToAnchorImages(root);
+    applySearchResultPlaceholders(root);
   }
 
   /* ==============================
@@ -243,6 +285,9 @@
 
           if (node.tagName === 'IMG') {
             markImageIfNSFW(node);
+            if (node.matches('img.mw-search-result-thumb') || node.closest('.mw-search-result-thumb')) {
+              rewriteSearchResultThumb(node);
+            }
           } else {
             scan(node);
           }

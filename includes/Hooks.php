@@ -57,11 +57,15 @@ class Hooks {
         // Keep your toggle
         $out->addJsConfigVars( [
             'wgNSFWUnblur' => $userWantsUnblur,
+            'wgNSFWPlaceholderImageUrl' => self::resolvePlaceholderUrl( $services ),
+            'wgNSFWProxyScriptUrl' => self::getProxyScriptUrl( $services ),
         ] );
 
         // Make your CSS's body override actually work (your CSS checks body.nsfw-unblur)
         if ( $userWantsUnblur ) {
             $out->addBodyClasses( 'nsfw-unblur' );
+        } else {
+            $out->addInlineScript( self::getSearchPreviewInlineScript() );
         }
 
         if ( $isContentPage ) {
@@ -92,6 +96,162 @@ class Hooks {
             return is_string( $maybe ) ? $maybe : '';
         }
         return '';
+    }
+
+    private static function getSearchPreviewInlineScript(): string {
+        return <<<'JS'
+( function () {
+    'use strict';
+
+    const isTruthy = ( v ) => v === true || v === 1 || v === '1' || v === 'true';
+    const userWantsUnblur = isTruthy( mw.config.get( 'wgNSFWUnblur' ) );
+    if ( userWantsUnblur ) {
+        return;
+    }
+
+    const proxyScriptUrl = mw.config.get( 'wgNSFWProxyScriptUrl' );
+    if ( !proxyScriptUrl ) {
+        return;
+    }
+
+    function extractFileDbKeyFromUrl( url ) {
+        if ( !url || typeof url !== 'string' ) {
+            return null;
+        }
+
+        const decoded = decodeURIComponent( url );
+
+        let match = decoded.match( /\/(?:img_auth\.php|images)\/thumb\/[^/]+\/[^/]+\/([^/"'?#]+\.[a-z0-9]{2,5})\//i );
+        if ( match && match[ 1 ] ) {
+            return match[ 1 ].replace( / /g, '_' );
+        }
+
+        match = decoded.match( /\/(?:img_auth\.php\/[^/]+\/[^/]+|images\/[^/]+\/[^/]+)\/([^/"'?#]+\.[a-z0-9]{2,5})/i );
+        if ( match && match[ 1 ] ) {
+            return match[ 1 ].replace( / /g, '_' );
+        }
+
+        match = decoded.match( /\/wiki\/File:([^/"'?#]+\.[a-z0-9]{2,5})/i );
+        if ( match && match[ 1 ] ) {
+            return match[ 1 ].replace( / /g, '_' );
+        }
+
+        match = decoded.match( /(?:[?&]title=)(?:File:)?([^&]+?\.[a-z0-9]{2,5})/i );
+        if ( match && match[ 1 ] ) {
+            return match[ 1 ].replace( / /g, '_' );
+        }
+
+        match = decoded.match( /\/([^/"'?#]+\.[a-z0-9]{2,5})$/i );
+        if ( match && match[ 1 ] ) {
+            return match[ 1 ].replace( / /g, '_' );
+        }
+
+        return null;
+    }
+
+    function extractWidthFromUrl( url ) {
+        if ( !url || typeof url !== 'string' ) {
+            return 0;
+        }
+
+        const decoded = decodeURIComponent( url );
+        const match = decoded.match( /(?:^|-)(\d+)px-/i );
+        return match && match[ 1 ] ? parseInt( match[ 1 ], 10 ) : 0;
+    }
+
+    function buildProxyUrl( fileDbKey, width ) {
+        if ( !fileDbKey ) {
+            return null;
+        }
+
+        try {
+            const url = new URL( proxyScriptUrl, window.location.href );
+            url.searchParams.set( 'title', `File:${ fileDbKey }` );
+            if ( width > 0 ) {
+                url.searchParams.set( 'width', String( width ) );
+            } else {
+                url.searchParams.delete( 'width' );
+            }
+            return url.toString();
+        } catch ( e ) {
+            return null;
+        }
+    }
+
+    function rewritePreviewImage( img ) {
+        if ( !img || img.dataset.nsfwPreviewProxy === '1' ) {
+            return;
+        }
+
+        const src = img.getAttribute( 'src' ) || img.getAttribute( 'data-src' );
+        if ( !src ) {
+            return;
+        }
+
+        const fileDbKey = extractFileDbKeyFromUrl( src );
+        if ( !fileDbKey ) {
+            return;
+        }
+
+        const widthAttr = img.getAttribute( 'width' );
+        const width = ( widthAttr && /^\d+$/.test( widthAttr ) ) ?
+            parseInt( widthAttr, 10 ) :
+            extractWidthFromUrl( src );
+
+        const proxyUrl = buildProxyUrl( fileDbKey, width );
+        if ( !proxyUrl ) {
+            return;
+        }
+
+        img.setAttribute( 'src', proxyUrl );
+        if ( img.hasAttribute( 'srcset' ) ) {
+            img.setAttribute( 'srcset', '' );
+        }
+        if ( img.hasAttribute( 'data-src' ) ) {
+            img.setAttribute( 'data-src', proxyUrl );
+        }
+        if ( img.hasAttribute( 'data-srcset' ) ) {
+            img.setAttribute( 'data-srcset', '' );
+        }
+
+        img.dataset.nsfwPreviewProxy = '1';
+    }
+
+    function scan( root ) {
+        const scope = root || document;
+        scope.querySelectorAll( '.cdx-typeahead-search img, .continuum-typeahead-search-container img' )
+            .forEach( rewritePreviewImage );
+    }
+
+    function observe() {
+        const observer = new MutationObserver( ( mutations ) => {
+            for ( const m of mutations ) {
+                for ( const node of m.addedNodes ) {
+                    if ( !( node instanceof Element ) ) {
+                        continue;
+                    }
+
+                    if ( node.tagName === 'IMG' ) {
+                        rewritePreviewImage( node );
+                    } else {
+                        scan( node );
+                    }
+                }
+            }
+        } );
+
+        observer.observe( document.body, {
+            childList: true,
+            subtree: true
+        } );
+    }
+
+    $( () => {
+        scan( document );
+        observe();
+    } );
+}() );
+JS;
     }
 
     private static function shouldRestrictPageContent( MediaWikiServices $services, OutputPage $out ): bool {
@@ -358,6 +518,35 @@ class Hooks {
         return $s;
     }
 
+    public static function resolveSearchResultThumbnailFileTitle(
+        \MediaWiki\Search\Entity\SearchResultThumbnail $thumbnail
+    ): ?Title {
+        $name = $thumbnail->getName();
+        if ( is_string( $name ) && $name !== '' ) {
+            $title = Title::newFromText( $name, NS_FILE );
+            if ( $title && $title->inNamespace( NS_FILE ) ) {
+                return $title;
+            }
+        }
+
+        $url = $thumbnail->getUrl();
+        if ( !is_string( $url ) || $url === '' ) {
+            return null;
+        }
+
+        $dbKey = self::extractImageDbKeyFromImgAuthUrl( $url );
+        if ( !$dbKey ) {
+            $dbKey = self::extractImageDbKeyFromUrl( $url );
+        }
+
+        if ( !$dbKey ) {
+            return null;
+        }
+
+        $title = Title::newFromText( $dbKey, NS_FILE );
+        return ( $title && $title->inNamespace( NS_FILE ) ) ? $title : null;
+    }
+
 
     /* ============================================================
      *  SPECIAL PAGES (LISTFILES / NEWFILES)
@@ -376,6 +565,88 @@ class Hooks {
     /* ============================================================
      *  PREFERENCES
      * ========================================================== */
+    public static function onSpecialSearchResultsAppend( $specialSearch, OutputPage $out, $term ): void {
+        $html = self::getOutputHtml( $out );
+        if ( !is_string( $html ) || $html === '' ) {
+            return;
+        }
+
+        $rewritten = self::rewriteNsfwImgAuthUrlsInHtml( $html );
+        $rewritten = self::rewriteNsfwMediaUrlsInHtml( $rewritten );
+        $rewritten = self::rewriteNsfwDomAttributesInHtml( $rewritten );
+
+        if ( $rewritten === $html ) {
+            return;
+        }
+
+        $out->clearHTML();
+        $out->addHTML( $rewritten );
+    }
+
+    public static function onSearchResultProvideThumbnail(
+        array $pageIdentities,
+        array &$thumbnails,
+        ?int $size = null
+    ): void {
+        if ( $thumbnails === [] ) {
+            return;
+        }
+
+        $services = MediaWikiServices::getInstance();
+        $placeholderUrl = self::resolvePlaceholderUrl( $services );
+
+        foreach ( $thumbnails as $pageId => $thumbnail ) {
+            if ( !$thumbnail instanceof \MediaWiki\Search\Entity\SearchResultThumbnail ) {
+                continue;
+            }
+
+            $pageTitle = isset( $pageIdentities[$pageId] )
+                ? Title::newFromPageIdentity( $pageIdentities[$pageId] )
+                : null;
+
+            $pageIsNsfw = $pageTitle ? self::isContentTitleMarkedNSFW( $pageTitle ) : false;
+
+            if ( $pageIsNsfw && $placeholderUrl ) {
+                $thumbnails[$pageId] = new \MediaWiki\Search\Entity\SearchResultThumbnail(
+                    $thumbnail->getMimeType(),
+                    $thumbnail->getSize(),
+                    $thumbnail->getWidth(),
+                    $thumbnail->getHeight(),
+                    $thumbnail->getDuration(),
+                    $placeholderUrl,
+                    $thumbnail->getName()
+                );
+                continue;
+            }
+
+            $fileTitle = self::resolveSearchResultThumbnailFileTitle( $thumbnail );
+            if ( !$fileTitle || !self::isFileTitleMarkedNSFW( $fileTitle ) ) {
+                continue;
+            }
+
+            $width = $thumbnail->getWidth();
+            if ( !$width && $size ) {
+                $width = (int)$size;
+            }
+
+            $transformParams = self::sanitizeTransformParams( [
+                'width' => (int)$width,
+                'height' => (int)( $thumbnail->getHeight() ?? 0 )
+            ] );
+
+            $proxyUrl = self::buildProxyUrlForFileTitle( $fileTitle, $transformParams );
+
+            $thumbnails[$pageId] = new \MediaWiki\Search\Entity\SearchResultThumbnail(
+                $thumbnail->getMimeType(),
+                $thumbnail->getSize(),
+                $thumbnail->getWidth(),
+                $thumbnail->getHeight(),
+                $thumbnail->getDuration(),
+                $proxyUrl,
+                $thumbnail->getName()
+            );
+        }
+    }
 
     public static function onGetPreferences( $user, &$preferences ): bool {
         $services = MediaWikiServices::getInstance();
@@ -750,7 +1021,7 @@ class Hooks {
      *  NSFW DETECTION (MARKER OR CATEGORY)
      * ========================================================== */
 
-    private static function isFileTitleMarkedNSFW( Title $fileTitle ): bool {
+    public static function isFileTitleMarkedNSFW( Title $fileTitle ): bool {
         static $memo = [];
 
         if ( !$fileTitle->inNamespace( NS_FILE ) ) {
@@ -789,7 +1060,7 @@ class Hooks {
 
 
 
-    private static function isContentTitleMarkedNSFW( Title $title ): bool {
+    public static function isContentTitleMarkedNSFW( Title $title ): bool {
         static $memo = [];
 
         if ( !$title ) {
@@ -911,6 +1182,16 @@ class Hooks {
         }
 
         return $file;
+    }
+
+    private static function resolvePlaceholderUrl( MediaWikiServices $services ): ?string {
+        $placeholderFile = self::resolvePlaceholderFile( $services );
+        if ( !$placeholderFile ) {
+            return null;
+        }
+
+        $url = $placeholderFile->getUrl();
+        return is_string( $url ) && $url !== '' ? $url : null;
     }
 
     private static function resolvePlaceholderTitle( MediaWikiServices $services ): ?Title {
@@ -1183,7 +1464,7 @@ class Hooks {
         return $fileTitle;
     }
 
-    private static function buildProxyUrlForFileTitle( Title $fileTitle, array $transformParams = [] ): string {
+    public static function buildProxyUrlForFileTitle( Title $fileTitle, array $transformParams = [] ): string {
         $services = MediaWikiServices::getInstance();
         $query = [ 'title' => $fileTitle->getPrefixedDBkey() ];
 

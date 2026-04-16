@@ -2,7 +2,7 @@
 
 Blurs images marked as NSFW in their file description, based on user preference.
 
-- __Blurs images if file page description contains `__NSFW__`.  
+- __Blurs images marked with `[[Category:NSFW Files]]`.  
 - __Respects user preference set in Preferences → Appearance → Files (`displayfiltered`).__
 - __Internationalized with translations for EN, ES, FR, DE, IT, KO, ZH, JA, PT, RU, UK.__
 
