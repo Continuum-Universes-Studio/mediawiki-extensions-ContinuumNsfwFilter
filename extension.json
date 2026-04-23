@@ -1,6 +1,6 @@
 {
   "name": "NSFW Filter",
-  "version": "2.3.0",
+  "version": "2.5.0",
   "author": "OnikaGPT 4o, Christian Daniel Jensen, ChatGPT-5.2",
   "url": "https://www.mediawiki.org/wiki/Extension:NSFW_Filter",
   "license-name": "GPL-3.0-or-later",
@@ -19,10 +19,10 @@
     }
   },
   "AutoloadClasses": {
-    "NsfwFilter\\Hooks": "includes/Hooks.php"
+    "ContinuumNsfwFilter\\Hooks": "includes/Hooks.php"
   },
   "MessagesDirs": {
-    "NsfwFilter": [
+    "ContinuumNsfwFilter": [
       "i18n"
     ]
   },
@@ -47,27 +47,27 @@
     "nsfwblurred": 0
   },
     "Hooks": {
-        "BeforePageDisplay": "NsfwFilter\\Hooks::onBeforePageDisplay",
-        "OutputPageBeforeHTML": "NsfwFilter\\Hooks::onOutputPageBeforeHTML",
-        "ThumbnailBeforeProduceHTML": "NsfwFilter\\Hooks::onThumbnailBeforeProduceHTML",
-        "OutputPageParserOutput": "NsfwFilter\\Hooks::onOutputPageParserOutput",
-        "OutputPageParserOutputComplete": "NsfwFilter\\Hooks::onOutputPageParserOutputComplete",
+        "BeforePageDisplay": "ContinuumNsfwFilter\\Hooks::onBeforePageDisplay",
+        "OutputPageBeforeHTML": "ContinuumNsfwFilter\\Hooks::onOutputPageBeforeHTML",
+        "ThumbnailBeforeProduceHTML": "ContinuumNsfwFilter\\Hooks::onThumbnailBeforeProduceHTML",
+        "OutputPageParserOutput": "ContinuumNsfwFilter\\Hooks::onOutputPageParserOutput",
+        "OutputPageParserOutputComplete": "ContinuumNsfwFilter\\Hooks::onOutputPageParserOutputComplete",
 
-        "ParserOutput": "NsfwFilter\\Hooks::onParserOutput",
+        "ParserOutput": "ContinuumNsfwFilter\\Hooks::onParserOutput",
 
-        "SpecialPageBeforeExecute": "NsfwFilter\\Hooks::onSpecialPageBeforeExecute",
-        "SpecialSearchResultsAppend": "NsfwFilter\\Hooks::onSpecialSearchResultsAppend",
-        "SearchResultProvideThumbnail": "NsfwFilter\\Hooks::onSearchResultProvideThumbnail",
-        "ShowSearchHit": "NsfwFilter\\Hooks::onShowSearchHit",
+        "SpecialPageBeforeExecute": "ContinuumNsfwFilter\\Hooks::onSpecialPageBeforeExecute",
+        "SpecialSearchResultsAppend": "ContinuumNsfwFilter\\Hooks::onSpecialSearchResultsAppend",
+        "SearchResultProvideThumbnail": "ContinuumNsfwFilter\\Hooks::onSearchResultProvideThumbnail",
+        "ShowSearchHit": "ContinuumNsfwFilter\\Hooks::onShowSearchHit",
 
-        "ImageBeforeProduceHTML": "NsfwFilter\\Hooks::onImageBeforeProduceHTML",
-        "ImagePageFindFile": "NsfwFilter\\Hooks::onImagePageFindFile",
-        "ImgAuthModifyHeaders": "NsfwFilter\\Hooks::onImgAuthModifyHeaders",
-        "GetPreferences": "NsfwFilter\\Hooks::onGetPreferences",
+        "ImageBeforeProduceHTML": "ContinuumNsfwFilter\\Hooks::onImageBeforeProduceHTML",
+        "ImagePageFindFile": "ContinuumNsfwFilter\\Hooks::onImagePageFindFile",
+        "ImgAuthModifyHeaders": "ContinuumNsfwFilter\\Hooks::onImgAuthModifyHeaders",
+        "GetPreferences": "ContinuumNsfwFilter\\Hooks::onGetPreferences",
 
-        "PageRenderingHash": "NsfwFilter\\Hooks::onPageRenderingHash",
-        "UserGetDefaultOptions": "NsfwFilter\\Hooks::onUserGetDefaultOptions",
-        "UserSaveOptions": "NsfwFilter\\Hooks::onUserSaveOptions"        
+        "PageRenderingHash": "ContinuumNsfwFilter\\Hooks::onPageRenderingHash",
+        "UserGetDefaultOptions": "ContinuumNsfwFilter\\Hooks::onUserGetDefaultOptions",
+        "UserSaveOptions": "ContinuumNsfwFilter\\Hooks::onUserSaveOptions"        
    }
         
 }
