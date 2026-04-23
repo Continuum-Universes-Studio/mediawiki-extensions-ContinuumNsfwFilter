@@ -529,6 +529,118 @@ JS;
         return $s;
     }
 
+    private static function resolveSearchThumbReplacementUrl(
+        MediaWikiServices $services,
+        Title $pageTitle,
+        User $user
+    ): ?string {
+        $fileTitle = self::resolveSearchThumbFileTitleForPage( $services, $pageTitle );
+        if ( $fileTitle ) {
+            if ( self::shouldUsePlaceholderReplacement( $services, $fileTitle, $user ) ) {
+                return self::buildProxyUrlForFileTitle( $fileTitle, [ 'width' => 120 ] );
+            }
+
+            $thumbUrl = self::resolveSearchThumbPageImageUrl( $services, $pageTitle, $user );
+            if ( $thumbUrl ) {
+                return $thumbUrl;
+            }
+        }
+
+        $pageRequirements = self::getContentTitleVisibilityRequirements( $pageTitle );
+        if (
+            self::hasAnyNsfwRequirements( $pageRequirements )
+            && !self::userMeetsNsfwRequirements( $services, $user, $pageRequirements )
+        ) {
+            return self::resolvePlaceholderUrl( $services );
+        }
+
+        return null;
+    }
+
+    private static function resolveSearchThumbPageImageUrl(
+        MediaWikiServices $services,
+        Title $pageTitle,
+        User $user
+    ): ?string {
+        $pageId = $pageTitle->getArticleID();
+        if ( !$pageId ) {
+            return null;
+        }
+
+        try {
+            $dbr = $services->getConnectionProvider()->getReplicaDatabase();
+            $image = $dbr->newSelectQueryBuilder()
+                ->select( 'pp_value' )
+                ->from( 'page_props' )
+                ->where( [
+                    'pp_propname' => 'page_image_free',
+                    'pp_page' => (int)$pageId,
+                ] )
+                ->caller( __METHOD__ )
+                ->fetchField();
+        } catch ( \Throwable $e ) {
+            return null;
+        }
+
+        if ( !is_string( $image ) || $image === '' ) {
+            return null;
+        }
+
+        $fileTitle = Title::newFromText( $image, NS_FILE );
+        if ( !$fileTitle || !$fileTitle->inNamespace( NS_FILE ) ) {
+            return null;
+        }
+
+        $file = self::resolveRepoFile( $services, $fileTitle );
+        if ( !$file || !$file->exists() ) {
+            return null;
+        }
+
+        if ( self::shouldUsePlaceholderReplacement( $services, $fileTitle, $user ) ) {
+            return self::buildProxyUrlForFileTitle( $fileTitle, [ 'width' => 120 ] );
+        }
+
+        $thumb = $file->createThumb( 120 );
+        return is_string( $thumb ) && $thumb !== '' ? $thumb : null;
+    }
+
+    private static function resolveSearchThumbFileTitleForPage(
+        MediaWikiServices $services,
+        Title $pageTitle
+    ): ?Title {
+        $pageId = $pageTitle->getArticleID();
+        if ( !$pageId ) {
+            return null;
+        }
+
+        try {
+            $dbr = $services->getConnectionProvider()->getReplicaDatabase();
+            $image = $dbr->newSelectQueryBuilder()
+                ->select( 'pp_value' )
+                ->from( 'page_props' )
+                ->where( [
+                    'pp_propname' => 'page_image_free',
+                    'pp_page' => (int)$pageId,
+                ] )
+                ->caller( __METHOD__ )
+                ->fetchField();
+        } catch ( \Throwable $e ) {
+            return null;
+        }
+
+        if ( !is_string( $image ) || $image === '' ) {
+            return null;
+        }
+
+        $fileTitle = Title::newFromText( $image, NS_FILE );
+        if ( !$fileTitle || !$fileTitle->inNamespace( NS_FILE ) ) {
+            return null;
+        }
+
+        $file = self::resolveRepoFile( $services, $fileTitle );
+        return ( $file && $file->exists() ) ? $fileTitle : null;
+    }
+
     public static function resolveSearchResultThumbnailFileTitle(
         \MediaWiki\Search\Entity\SearchResultThumbnail $thumbnail
     ): ?Title {
@@ -666,6 +778,65 @@ JS;
                 $thumbnail->getName()
             );
         }
+    }
+
+    public static function onShowSearchHit(
+        $searchPage,
+        $result,
+        $terms,
+        &$link,
+        &$redirect,
+        &$section,
+        &$extract,
+        $score,
+        &$size,
+        &$date,
+        &$related,
+        &$html
+    ): void {
+        if ( !is_string( $link ) || $link === '' || !method_exists( $result, 'getTitle' ) ) {
+            return;
+        }
+
+        $pageTitle = $result->getTitle();
+        if ( !$pageTitle instanceof Title ) {
+            return;
+        }
+
+        $services = MediaWikiServices::getInstance();
+        $user = RequestContext::getMain()->getUser();
+        if ( !$user instanceof User ) {
+            return;
+        }
+
+        $replacementUrl = self::resolveSearchThumbReplacementUrl( $services, $pageTitle, $user );
+        if ( !$replacementUrl ) {
+            return;
+        }
+
+        $quotedUrl = htmlspecialchars( $replacementUrl, ENT_QUOTES );
+
+        if ( preg_match( '/<img\b[^>]*\bclass="[^"]*\bmw-search-result-thumb\b[^"]*"[^>]*>/i', $link, $m ) ) {
+            $originalTag = $m[0];
+            $replacementTag = preg_replace(
+                '/\bsrc="[^"]*"/i',
+                'src="' . $quotedUrl . '"',
+                $originalTag,
+                1
+            );
+
+            if ( is_string( $replacementTag ) ) {
+                $link = preg_replace(
+                    '/<img\b[^>]*\bclass="[^"]*\bmw-search-result-thumb\b[^"]*"[^>]*>/i',
+                    $replacementTag,
+                    $link,
+                    1
+                );
+                return;
+            }
+        }
+
+        $link = '<img class="mw-search-result-thumb" src="' . $quotedUrl . '" />' . $link;
     }
 
     public static function onGetPreferences( $user, &$preferences ): bool {

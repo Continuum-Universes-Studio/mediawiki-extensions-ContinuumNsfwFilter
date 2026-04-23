@@ -3,6 +3,7 @@
   "version": "2.3.0",
   "author": "OnikaGPT 4o, Christian Daniel Jensen, ChatGPT-5.2",
   "url": "https://www.mediawiki.org/wiki/Extension:NSFW_Filter",
+  "license-name": "GPL-3.0-or-later",
   "descriptionmsg": "nsfwblur-desc",
   "type": "other",
   "manifest_version": 2,
@@ -57,6 +58,7 @@
         "SpecialPageBeforeExecute": "NsfwFilter\\Hooks::onSpecialPageBeforeExecute",
         "SpecialSearchResultsAppend": "NsfwFilter\\Hooks::onSpecialSearchResultsAppend",
         "SearchResultProvideThumbnail": "NsfwFilter\\Hooks::onSearchResultProvideThumbnail",
+        "ShowSearchHit": "NsfwFilter\\Hooks::onShowSearchHit",
 
         "ImageBeforeProduceHTML": "NsfwFilter\\Hooks::onImageBeforeProduceHTML",
         "ImagePageFindFile": "NsfwFilter\\Hooks::onImagePageFindFile",
