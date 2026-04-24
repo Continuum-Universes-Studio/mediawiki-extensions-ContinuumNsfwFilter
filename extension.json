@@ -36,10 +36,7 @@
     "sysop": {
       "nsfw-unblur": true
     },
-    "loremaster-supreme": {
-      "nsfw-unblur": true
-    },
-    "grand-forgemaster": {
+    "bureaucrat":{
       "nsfw-unblur": true
     }
   },
