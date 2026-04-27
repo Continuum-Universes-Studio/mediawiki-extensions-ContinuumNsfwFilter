@@ -1,0 +1,76 @@
+/* NSFW thumbnails / inline images: class is on the IMG */
+img.nsfw-blur {
+  filter: blur(24px);
+  transition: filter 160ms linear;
+}
+a.nsfw-blur > img {
+    filter: inherit;
+}
+
+/* Your existing body toggle can override */
+body.nsfw-unblur img.nsfw-blur {
+  filter: none;
+}
+
+/* MediaViewer: blur the displayed image when wrapper is flagged */
+.mw-mmv-wrapper.nsfw-mmv-blur .mw-mmv-image img {
+  filter: blur(24px);
+}
+
+/* Optional: respect your unblur mode globally */
+body.nsfw-unblur .mw-mmv-wrapper.nsfw-mmv-blur .mw-mmv-image img {
+  filter: none;
+}
+/* When wrapper is flagged, blur MMV image */
+.mw-mmv-wrapper.nsfw-mmv-blur .mw-mmv-image img {
+  filter: blur(24px);
+}
+.nsfw-blur img {
+  transition: none !important;
+  filter: blur(24px);
+}
+/* Universal NSFW blur — works for img, figure, gallery, thumbs */
+
+.nsfw-blur img,
+.nsfw-blur .mw-file-element,
+figure.nsfw-blur img,
+figure.nsfw-blur .mw-file-element,
+span.nsfw-blur img,
+span.nsfw-blur .mw-file-element {
+    filter: blur(24px) !important;
+}
+
+/* File: pages */
+body.nsfw-filepage-blur figure img,
+body.nsfw-filepage-blur .mw-file-element {
+    filter: blur(24px) !important;
+}
+
+body.nsfw-page-restricted .nsfw-page-restriction {
+    margin: 1.5rem auto;
+    max-width: 48rem;
+}
+
+body.nsfw-page-restricted .nsfw-page-restriction__title {
+    margin: 0 0 0.75rem;
+}
+
+body.nsfw-page-restricted .nsfw-page-restriction__body,
+body.nsfw-page-restricted .nsfw-page-restriction__actions,
+body.nsfw-page-restricted .nsfw-page-restriction__tip {
+    margin: 0 0 0.75rem;
+}
+
+body.nsfw-page-restricted .nsfw-page-restriction__actions {
+    font-weight: 600;
+}
+
+body.nsfw-page-restricted .nsfw-page-restriction__link {
+    font-weight: 600;
+}
+
+/* MediaViewer */
+body.nsfw-mmv-preblur .mw-mmv-image img,
+body.nsfw-mmv-preblur img.mw-mmv-final-image {
+    filter: blur(24px) !important;
+}

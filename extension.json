@@ -1,0 +1,74 @@
+{
+  "name": "Continuum NSFW Filter",
+  "version": "2.6.0",
+  "author": "OnikaGPT 4o, Christian Daniel Jensen, ChatGPT-5.2",
+  "url": "https://www.mediawiki.org/wiki/Extension:ContinuumNsfwFilter",
+  "license-name": "GPL-3.0-or-later",
+  "descriptionmsg": "nsfwblur-desc",
+  "type": "other",
+  "manifest_version": 2,
+  "requires": {
+    "MediaWiki": ">= 1.45.0",
+    "extensions": {
+      "ContinuumCore": "*"
+    }
+  },
+  "config": {
+    "NsfwFilterPlaceholderImage": {
+      "value": "NSFW-Placeholder.png",
+      "path": false,
+      "description": "File title used as the server-side placeholder for NSFW files requested through the ContinuumNsfwFilter proxy endpoint by viewers who are not allowed to see the original media.",
+      "public": false
+    }
+  },
+  "AutoloadClasses": {
+    "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks": "includes/Hooks.php"
+  },
+  "MessagesDirs": {
+    "ContinuumUniverses\\ContinuumNsfwFilter": [
+      "i18n"
+    ]
+  },
+  "AvailableRights": [
+    "nsfw-unblur"
+  ],
+  "GroupPermissions": {
+    "adultreader": {
+      "nsfw-unblur": true
+    },
+    "sysop": {
+      "nsfw-unblur": true
+    },
+    "bureaucrat":{
+      "nsfw-unblur": true
+    }
+  },
+  "DefaultUserOptions": {
+    "nsfwblurred": 0
+  },
+    "Hooks": {
+        "BeforePageDisplay": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onBeforePageDisplay",
+        "OutputPageBeforeHTML": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onOutputPageBeforeHTML",
+        "OutputPageAfterGetHeadLinksArray": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onOutputPageAfterGetHeadLinksArray",
+        "ThumbnailBeforeProduceHTML": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onThumbnailBeforeProduceHTML",
+        "OutputPageParserOutput": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onOutputPageParserOutput",
+        "OutputPageParserOutputComplete": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onOutputPageParserOutputComplete",
+
+        "ParserOutput": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onParserOutput",
+
+        "SpecialPageBeforeExecute": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onSpecialPageBeforeExecute",
+        "SpecialSearchResultsAppend": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onSpecialSearchResultsAppend",
+        "SearchResultProvideThumbnail": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onSearchResultProvideThumbnail",
+        "ShowSearchHit": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onShowSearchHit",
+
+        "ImageBeforeProduceHTML": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onImageBeforeProduceHTML",
+        "ImagePageFindFile": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onImagePageFindFile",
+        "ImgAuthModifyHeaders": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onImgAuthModifyHeaders",
+        "GetPreferences": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onGetPreferences",
+
+        "PageRenderingHash": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onPageRenderingHash",
+        "UserGetDefaultOptions": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onUserGetDefaultOptions",
+        "UserSaveOptions": "ContinuumUniverses\\ContinuumNsfwFilter\\Hooks::onUserSaveOptions"        
+   }
+        
+}
